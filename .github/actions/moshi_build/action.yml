@@ -1,0 +1,31 @@
+name: kame_build
+description: 'Build env for the KAME Python package.'
+runs:
+  using: "composite"
+  steps:
+  - uses: actions/setup-python@v2
+    with:
+      python-version: '3.10.14'
+  - uses: actions/cache@v3
+    id: cache
+    with:
+      path: env
+      key: env-${{ hashFiles('pyproject.toml') }}
+  - name: Install dependencies
+    if: steps.cache.outputs.cache-hit != 'true'
+    shell: bash
+    run: |
+      python3 -m venv env
+      .  env/bin/activate
+      python -m pip install --upgrade pip
+      pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu
+  - name: Setup env
+    shell: bash
+    run: |
+      source  env/bin/activate
+      pip install -e '.[dev]'
+      pre-commit install
+  - name: Install uv
+    uses: astral-sh/setup-uv@v6
+    with:
+      version: "0.8.13"

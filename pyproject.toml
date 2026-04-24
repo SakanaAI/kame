@@ -1,0 +1,77 @@
+[project]
+name = "kame-model"
+requires-python = ">= 3.10"
+description = "KAME Python inference package for spoken dialogue"
+dependencies = [
+    "numpy >= 1.26, < 2.3",
+    "safetensors >= 0.4.0, < 0.7",
+    "huggingface-hub >= 0.24, < 0.34",
+    "einops >= 0.7, < 0.9",
+    "sentencepiece == 0.2",
+    "sphn >= 0.1.4, < 0.2.0",
+    "torch >= 2.2.0, < 2.8",
+    "aiohttp>=3.10.5, <3.12",
+    "google-cloud-speech>=2.0.0, <3",
+    "openai>=1.0.0, <2",
+]
+authors = [{name="Sakana AI"}, {name="Kyutai"}]
+maintainers = [{name="Sakana AI"}]
+license = "MIT"
+license-files = ["LICENSE*"]
+dynamic = ["version"]
+readme = "README.md"
+
+[project.scripts]
+kame-server = "kame.server:cli"
+kame-server-oracle = "kame.server_oracle:cli"
+kame-inference = "kame.run_inference:cli"
+
+[tool.setuptools.dynamic]
+version = {attr = "kame.__version__"}
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kame", "kame.*"]
+
+[dependency-groups]
+dev = [
+    "pytest >= 8.3.3",
+    "ruff>=0.14.9",
+    "mypy>=1.19.1",
+    "pyright",
+    "flake8",
+    "pre-commit",
+    "gradio-webrtc>=0.0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyright",
+    "pytest",
+    "flake8",
+    "pre-commit",
+    "gradio-webrtc>=0.0.18",
+    "ruff>=0.14.9",
+    "mypy>=1.19.1",
+]
+tunnel = [
+    "gradio>=5.0.0",
+]
+quantization = [
+    "bitsandbytes >= 0.45, < 0.46; sys_platform == 'linux'",
+]
+
+# Ruff is not enforced atm, but if you want to use it on your code
+# (e.g. via "Format modified lines" in VSCode), you'll get these settings
+[tool.ruff]
+line-length = 120
+
+[tool.pyright]
+reportPrivateImportUsage = false

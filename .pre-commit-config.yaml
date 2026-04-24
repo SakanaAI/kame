@@ -1,0 +1,21 @@
+repos:
+  - repo: local
+    hooks:
+    - id: flake8-kame
+      name: flake8 on kame package
+      language: system
+      entry: bash -c 'uv run --active --no-sync flake8 src/kame tests'
+      pass_filenames: false
+      always_run: true
+    - id: pyright-kame
+      name: pyright on kame package
+      language: system
+      entry: bash -c 'uv run --active --no-sync pyright src/kame tests'
+      pass_filenames: false
+      always_run: true
+    - id: tests-kame
+      name: pytests on kame package
+      language: system
+      entry: bash -c 'uv run --active --no-sync pytest tests'
+      pass_filenames: false
+      always_run: true

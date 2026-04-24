@@ -1,0 +1,10 @@
+einops==0.7.0
+safetensors==0.4.4
+sentencepiece==0.2.0
+sphn==0.1.4
+torch==2.2.0
+numpy==1.26.4
+aiohttp>=3.10.5, <3.12
+huggingface-hub>=0.24, <0.34
+google-cloud-speech>=2.0.0,<3
+openai>=1.0.0,<2
