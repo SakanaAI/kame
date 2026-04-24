@@ -186,3 +186,6 @@ mlx-trace.json
 /scripts/token.txt
 uv.lock
 tts-outputs
+
+# Keep the small safetensors fixtures used by unit tests under version control.
+!tests/assets/*.safetensors
