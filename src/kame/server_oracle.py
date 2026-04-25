@@ -325,6 +325,7 @@ class AsyncASRProcessor:
 
         # Google Speech
         self.asr_enabled = False
+        self.init_error: str | None = None
         self.speech_client = None
         self.config = None
         self.streaming_config = None
@@ -346,31 +347,36 @@ class AsyncASRProcessor:
 
     def _initialize_speech_client(self):
         try:
-            if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
-                self.speech_client = speech.SpeechClient()
-                language_code = ASR_LANGUAGE_CODE
-                self.config = speech.RecognitionConfig(
-                    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=self.target_sample_rate,
-                    language_code=language_code,
-                    enable_automatic_punctuation=False,
-                    enable_word_time_offsets=False,
-                    enable_word_confidence=False,
-                    use_enhanced=True,
-                    metadata=speech.RecognitionMetadata(
-                        interaction_type=speech.RecognitionMetadata.InteractionType.VOICE_SEARCH,
-                        microphone_distance=speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
-                        recording_device_type=speech.RecognitionMetadata.RecordingDeviceType.PC,
-                    ),
-                )
-                self.streaming_config = speech.StreamingRecognitionConfig(
-                    config=self.config,
-                    interim_results=True,
-                    single_utterance=False,
-                )
-                self.asr_enabled = True
-                log("info", f"Async ASR processor initialized (language: {language_code})")
+            if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+                self.init_error = "GOOGLE_APPLICATION_CREDENTIALS environment variable is not set."
+                return
+
+            self.speech_client = speech.SpeechClient()
+            language_code = ASR_LANGUAGE_CODE
+            self.config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.target_sample_rate,
+                language_code=language_code,
+                enable_automatic_punctuation=False,
+                enable_word_time_offsets=False,
+                enable_word_confidence=False,
+                use_enhanced=True,
+                metadata=speech.RecognitionMetadata(
+                    interaction_type=speech.RecognitionMetadata.InteractionType.VOICE_SEARCH,
+                    microphone_distance=speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
+                    recording_device_type=speech.RecognitionMetadata.RecordingDeviceType.PC,
+                ),
+            )
+            self.streaming_config = speech.StreamingRecognitionConfig(
+                config=self.config,
+                interim_results=True,
+                single_utterance=False,
+            )
+            self.asr_enabled = True
+            self.init_error = None
+            log("info", f"Async ASR processor initialized (language: {language_code})")
         except Exception as e:
+            self.init_error = str(e)
             log("warning", f"ASR initialization failed: {e}")
 
     async def start(self):
@@ -572,6 +578,24 @@ class AsyncASRProcessor:
                         pass
 
 
+def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRProcessor]) -> None:
+    if not enable_asr:
+        return
+
+    if asr_processor is not None and asr_processor.asr_enabled:
+        return
+
+    reason = "unknown error"
+    if asr_processor is not None and asr_processor.init_error:
+        reason = asr_processor.init_error
+    raise RuntimeError(
+        "ASR is enabled but Google Speech-to-Text could not be initialized. "
+        f"{reason} "
+        "Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
+        "or rerun with --no-enable-asr."
+    )
+
+
 @dataclass
 class ServerState:
     model_type: str
@@ -626,6 +650,7 @@ class ServerState:
 
         # ASR processor
         self.asr_processor = AsyncASRProcessor(sample_rate=int(self.mimi.sample_rate)) if enable_asr else None
+        _require_initialized_asr(enable_asr, self.asr_processor)
 
         # LLM stream manager (uses oracle_queue; never touches lm_gen directly)
         self.llm_stream_manager = LLMStreamManager(
