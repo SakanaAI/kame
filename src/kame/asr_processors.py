@@ -596,6 +596,9 @@ class OpenAIRealtimeASRProcessor:
             raise RuntimeError(f"OpenAI Realtime error event: {error}")
 
         if event_type == "conversation.item.input_audio_transcription.failed":
+            item_id = event.get("item_id")
+            if item_id is not None:
+                self._partial_transcripts.pop(str(item_id), None)
             error = event.get("error", event)
             log("warning", f"OpenAI Realtime transcription failed: {error}")
 
