@@ -86,7 +86,44 @@ with the package source under [`src/kame/`](src/kame/).
 
 ## Typical Usage
 
-For local development:
+### Run from the Hugging Face Checkpoint
+
+The public checkpoint can be loaded directly from Hugging Face with
+`--hf-repo`. The package distribution name is `kame-model`, while the Python
+module name is `kame`.
+
+```bash
+uv init --bare --python 3.12
+uv add "kame-model @ git+https://github.com/SakanaAI/kame.git@1a69ee29dbd201d400f841459d87871154881047"
+
+export OPENAI_API_KEY=...
+
+uv run python -m kame.server_oracle \
+  --hf-repo SakanaAI/kame \
+  --host 0.0.0.0 \
+  --port 8998 \
+  --device cuda
+```
+
+Then open `http://localhost:8998`.
+
+`kame-model` is not published on PyPI yet, so the example above installs it
+directly from GitHub. For reproducible runs, pin a release tag or commit instead
+of installing from `main`.
+
+Notes:
+
+- Python `>=3.10` is supported; the command above uses Python 3.12 because it is
+  the version used for verification.
+- `OPENAI_API_KEY` is required by `kame.server_oracle`.
+- ASR uses Google Cloud Speech-to-Text when `GOOGLE_APPLICATION_CREDENTIALS` is
+  set. Without it, ASR initialization is skipped.
+- `--config-path`, `--moshi-weight`, `--mimi-weight`, and `--tokenizer` are not
+  needed for the public Hugging Face checkpoint in the usual case.
+- `config.json` in the Hugging Face repo resolves the model weights, Mimi
+  checkpoint, tokenizer, and optional generation settings.
+
+### Local Development
 
 ```bash
 pip install -e .
