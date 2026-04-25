@@ -379,24 +379,6 @@ class AsyncASRProcessor:
             self.init_error = str(e)
             log("warning", f"ASR initialization failed: {e}")
 
-
-def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRProcessor]) -> None:
-    if not enable_asr:
-        return
-
-    if asr_processor is not None and asr_processor.asr_enabled:
-        return
-
-    reason = "unknown error"
-    if asr_processor is not None and asr_processor.init_error:
-        reason = asr_processor.init_error
-    raise RuntimeError(
-        "ASR is enabled but Google Speech-to-Text could not be initialized. "
-        f"{reason} "
-        "Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
-        "or rerun with --no-enable-asr."
-    )
-
     async def start(self):
         if self.asr_enabled and not self.running:
             self.running = True
@@ -594,6 +576,24 @@ def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRP
                     except Exception:
                         # Callback errors should not stop ASR streaming; ignore.
                         pass
+
+
+def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRProcessor]) -> None:
+    if not enable_asr:
+        return
+
+    if asr_processor is not None and asr_processor.asr_enabled:
+        return
+
+    reason = "unknown error"
+    if asr_processor is not None and asr_processor.init_error:
+        reason = asr_processor.init_error
+    raise RuntimeError(
+        "ASR is enabled but Google Speech-to-Text could not be initialized. "
+        f"{reason} "
+        "Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
+        "or rerun with --no-enable-asr."
+    )
 
 
 @dataclass
