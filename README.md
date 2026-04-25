@@ -96,7 +96,7 @@ module name is `kame`.
 
 ```bash
 uv init --bare --python 3.12
-uv add "kame-model @ git+https://github.com/SakanaAI/kame.git@1a69ee29dbd201d400f841459d87871154881047"
+uv add "kame-model @ git+https://github.com/SakanaAI/kame.git@main"
 
 export OPENAI_API_KEY=...
 
