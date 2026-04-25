@@ -66,7 +66,7 @@ python -m kame.server --help
 - ASR is enabled by default and uses OpenAI Realtime transcription
   (`gpt-4o-mini-transcribe`). Use `--asr-provider google` to use Google Cloud
   Speech-to-Text instead.
-- The current oracle-guided server path is configured for English dialogue and ASR.
+- `kame.server_oracle` supports English and Japanese dialogue via `--language en|ja`; the default is English.
 - If `--static` is omitted, the browser UI assets are fetched automatically at startup.
 - `kame.server_oracle` sends conversation text to OpenAI Chat Completions.
 - If ASR is enabled, `kame.server_oracle` sends audio to the selected ASR provider.
@@ -131,6 +131,26 @@ Notes:
   needed for the public Hugging Face checkpoint in the usual case.
 - `config.json` in the Hugging Face repo resolves the model weights, Mimi
   checkpoint, tokenizer, and optional generation settings.
+
+### Run Japanese Oracle Server
+
+For Japanese dialogue, pass `--language ja`. This switches the oracle prompt,
+ASR language defaults, and Japanese oracle token handling.
+
+```bash
+export OPENAI_API_KEY=...
+
+uv run python -m kame.server_oracle \
+  --hf-repo SakanaAI/kame \
+  --language ja \
+  --host 0.0.0.0 \
+  --port 8998 \
+  --device cuda
+```
+
+With the default OpenAI ASR provider, `--language ja` uses `ja` as the ASR
+language. With Google ASR, it uses `ja-JP`. Pass `--asr-language` only when you
+want to override this default.
 
 ### Local Development
 

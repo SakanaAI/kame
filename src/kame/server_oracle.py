@@ -36,9 +36,11 @@ from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
 
 # -----------------------
-# English-only inference configuration
+# Language-specific inference configuration
 # -----------------------
-SYSTEM_PROMPT = """
+SUPPORTED_LANGUAGES = ("en", "ja")
+SYSTEM_PROMPTS = {
+    "en": """
 You are Moshi, talking with the User. The User is currently mid-conversation.
 Predict the flow of the User's dialogue and generate a suitable next response accordingly.
 Generate only the dialogue directly, without any additional commentary.
@@ -46,7 +48,68 @@ Speak confidently on the predicted topic—there is no need to ask for confirmat
 Your answer must be short and concise in maximum 30 words. Do not include moshi: at the top.
 Sometimes you as Moshi say incorrect things. Pay attention to the User's statements and provide correct information.
 Since the output words will be spoken, do not include any symbols unrelated to pronunciation (e.g., " ー ;). Avoid anything not relevant to pronunciation.
-""".strip()
+""".strip(),
+    "ja": """
+あなたはMoshiです。ユーザーと会話しています。ユーザーは現在会話の途中です。
+ユーザーの発話の流れを予測し、それに応じた適切な次の応答を生成してください。
+追加の解説なしに、対話のみを直接生成してください。
+予測したトピックについて自信を持って話してください。確認を求める必要はありません。
+回答は最大30語以内で短く簡潔にしてください。先頭にmoshi:を含めないでください。
+Moshiとして間違ったことを言うこともあります。ユーザーの発言に注意し、正しい情報を提供してください。
+出力される言葉は音声として読み上げられるため、発音に関係のない記号（例：" ー ;）は含めないでください。
+""".strip(),
+}
+
+DEFAULT_ASR_LANGUAGES: dict[str, dict[ASRProvider, str]] = {
+    "en": {
+        "openai": DEFAULT_OPENAI_ASR_LANGUAGE,
+        "google": DEFAULT_GOOGLE_ASR_LANGUAGE,
+    },
+    "ja": {
+        "openai": "ja",
+        "google": "ja-JP",
+    },
+}
+
+
+def count_text_units(text: str, language: str) -> int:
+    """Count restart/logging units: words for English, non-space characters for Japanese."""
+    if not text or not text.strip():
+        return 0
+    if language == "ja":
+        return len(text.replace(" ", "").replace("　", ""))
+    return len(text.split())
+
+
+def resolve_asr_language(
+    language: str,
+    asr_provider: ASRProvider,
+    explicit_asr_language: str | None,
+) -> str:
+    if explicit_asr_language:
+        return explicit_asr_language
+    return DEFAULT_ASR_LANGUAGES.get(language, DEFAULT_ASR_LANGUAGES["en"])[asr_provider]
+
+
+def filter_oracle_token_ids_for_language(
+    token_ids: list[int],
+    text_tokenizer: sentencepiece.SentencePieceProcessor,
+    language: str,
+    *,
+    is_first_chunk: bool,
+) -> tuple[list[int], bool]:
+    """Apply language-specific cleanup before streaming oracle tokens to the LM."""
+    if language != "ja":
+        return token_ids, is_first_chunk
+
+    if is_first_chunk:
+        return token_ids, False
+
+    underscore_id = text_tokenizer.piece_to_id("▁")  # type: ignore[attr-defined]
+    if token_ids and token_ids[0] == underscore_id:
+        return token_ids[1:], False
+    return token_ids, False
+
 
 # -----------------------
 # Global conversation state (thread-safe)
@@ -141,10 +204,11 @@ class LLMStreamManager:
     The audio loop is the single writer to lm_gen to avoid race conditions.
     """
 
-    def __init__(self, server_state, interval=0.25, system_prompt=""):
+    def __init__(self, server_state, interval=0.25, system_prompt="", language="en"):
         self.server_state = server_state
         self.interval = interval
         self.system_prompt = system_prompt
+        self.language = language
         self.current_stream = None
         self.running = False
 
@@ -163,14 +227,11 @@ class LLMStreamManager:
         # Cumulative word count tracking (handles partial text sliding window)
         self.last_start_total_units = 0
 
-        self.min_units_delta = 2  # Require 2+ new words before restart
+        self.min_units_delta = 6 if self.language == "ja" else 2
         self.max_restarts_per_2s = 5
 
     def _count_units(self, text: str) -> int:
-        """Count whitespace-delimited words."""
-        if not text or not text.strip():
-            return 0
-        return len(text.split())
+        return count_text_units(text, self.language)
 
     def _restart_allowed(self) -> bool:
         now = time.time()
@@ -334,11 +395,14 @@ class ServerState:
         asr_provider: ASRProvider = DEFAULT_ASR_PROVIDER,
         asr_model: str = DEFAULT_OPENAI_ASR_MODEL,
         asr_language: str | None = None,
+        language: str = "en",
         **kwargs,
     ):
         self.model_type = model_type
         self.mimi = mimi
         self.text_tokenizer = text_tokenizer
+        self.language = language
+        self.asr_language = resolve_asr_language(language, asr_provider, asr_language)
         condition_tensors = get_condition_tensors(model_type, lm, batch_size=1, cfg_coef=cfg_coef)
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
 
@@ -374,7 +438,7 @@ class ServerState:
                 provider=asr_provider,
                 sample_rate=int(self.mimi.sample_rate),
                 model=asr_model,
-                language=asr_language,
+                language=self.asr_language,
             )
             if enable_asr
             else None
@@ -385,9 +449,11 @@ class ServerState:
         self.llm_stream_manager = LLMStreamManager(
             server_state=self,
             interval=0.5,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPTS.get(language, SYSTEM_PROMPTS["en"]),
+            language=language,
         )
         self.llm_stream_task = None
+        self._oracle_first_chunk = True
 
     # ----- Pending user text API -----
     def get_pending_user_text(self) -> str:
@@ -405,10 +471,7 @@ class ServerState:
             asyncio.run_coroutine_threadsafe(self._asr_on_partial_async(text), self.loop)
 
     def _count_units(self, text: str) -> int:
-        """Count whitespace-delimited words."""
-        if not text or not text.strip():
-            return 0
-        return len(text.split())
+        return count_text_units(text, self.language)
 
     async def _asr_on_partial_async(self, text: str):
         # Minimal locking; do not write to conversation here
@@ -540,10 +603,17 @@ class ServerState:
                         action, payload = self.oracle_queue.get_nowait()
                         timestamp_ms = int(time.time() * 1000)
                         if action == "reset":
+                            self._oracle_first_chunk = True
                             self.lm_gen.update_oracle_tokens_streaming(None, reset=True)
                             _append_session_log("oracle_stream.txt", f"{timestamp_ms}: [RESET]\n")
                         elif action == "append" and payload:
                             token_ids = list(self.text_tokenizer.encode(payload))  # type: ignore[attr-defined]
+                            token_ids, self._oracle_first_chunk = filter_oracle_token_ids_for_language(
+                                token_ids,
+                                self.text_tokenizer,
+                                self.language,
+                                is_first_chunk=self._oracle_first_chunk,
+                            )
                             self.lm_gen.update_oracle_tokens_streaming(token_ids, reset=False)
                             _append_session_log("oracle_stream.txt", f"{timestamp_ms}: {payload}\n")
                 except asyncio.QueueEmpty:
@@ -706,6 +776,12 @@ def main():
         help="Enable ASR processing for transcription (default: True)",
     )
     parser.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGES,
+        default="en",
+        help="Conversation language for ASR defaults, LLM prompting, and oracle token handling.",
+    )
+    parser.add_argument(
         "--asr-provider",
         choices=("openai", "google"),
         default=DEFAULT_ASR_PROVIDER,
@@ -724,10 +800,7 @@ def main():
         "--asr-language",
         type=str,
         default=None,
-        help=(
-            "ASR language code. Defaults to provider-specific values "
-            f"({DEFAULT_OPENAI_ASR_LANGUAGE} for OpenAI, {DEFAULT_GOOGLE_ASR_LANGUAGE} for Google)."
-        ),
+        help=("Explicit ASR language code. If omitted, defaults from --language and --asr-provider are used."),
     )
     parser.add_argument(
         "--ssl",
@@ -750,6 +823,11 @@ def main():
     args = parser.parse_args()
     seed_all(42424242)
     configure_save_dir(args.log_dir or os.environ.get("MOSHI_LOG_DIR"))
+    effective_asr_language = resolve_asr_language(
+        args.language,
+        args.asr_provider,
+        args.asr_language,
+    )
 
     setup_tunnel = None
     tunnel_token = ""
@@ -797,10 +875,11 @@ def main():
         enable_asr=args.enable_asr,
         asr_provider=args.asr_provider,
         asr_model=args.asr_model,
-        asr_language=args.asr_language,
+        asr_language=effective_asr_language,
+        language=args.language,
         **checkpoint_info.lm_gen_config,
     )
-    log("info", "warming up the model")
+    log("info", f"warming up the model (language: {args.language})")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
@@ -843,8 +922,7 @@ def main():
         asr_detail = f"provider: {args.asr_provider}"
         if args.asr_provider == "openai":
             asr_detail += f", model: {args.asr_model}"
-        if args.asr_language:
-            asr_detail += f", language: {args.asr_language}"
+        asr_detail += f", language: {effective_asr_language}"
         log(
             "info",
             f"ASR processing enabled ({asr_detail}) - partials stream to LLM; finals commit to transcript",
