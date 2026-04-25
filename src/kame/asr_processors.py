@@ -262,9 +262,9 @@ class GoogleASRProcessor:
                 return
             responses = self.speech_client.streaming_recognize(self.streaming_config, requests)
             self._process_responses(responses)
-        except Exception as e:
+        except Exception:
             if self.running:
-                raise e
+                raise
 
     def _process_responses(self, responses):
         for response in responses:
