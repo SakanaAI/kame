@@ -12,9 +12,9 @@ from kame.asr_processors import (
 
 
 class DisabledASRProcessor:
-    asr_enabled = False
-    init_error = "missing credentials"
-    running = False
+    asr_enabled: bool = False
+    init_error: str | None = "missing credentials"
+    running: bool = False
 
     def register_callbacks(self, on_partial, on_final):
         pass
