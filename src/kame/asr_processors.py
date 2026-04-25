@@ -34,6 +34,21 @@ class ASRProcessor(Protocol):
     def process_audio(self, pcm_data): ...
 
 
+def _linear_resample_int16(x_int16: np.ndarray, src_hz: int, dst_hz: int) -> np.ndarray:
+    """Very lightweight linear resample to reduce aliasing vs index stepping."""
+    if src_hz == dst_hz:
+        return x_int16
+    n_src = len(x_int16)
+    n_dst = int(n_src * dst_hz / src_hz)
+    if n_dst <= 0:
+        return np.zeros(0, dtype=np.int16)
+    src_idx = np.arange(n_src, dtype=np.float64)
+    dst_pos = np.linspace(0, n_src - 1, n_dst, endpoint=True)
+    y = np.interp(dst_pos, src_idx, x_int16.astype(np.float64))
+    y = np.clip(y, -32768, 32767).astype(np.int16)
+    return y
+
+
 class GoogleASRProcessor:
     """Async ASR with Google Speech-to-Text. Produces partial (pending) and final commits via callbacks.
     Audio is pushed via process_audio(...) from the main audio loop thread.
@@ -131,21 +146,6 @@ class GoogleASRProcessor:
                     pass
             log("info", f"Async ASR streaming stopped. Stats: {self.stats}")
 
-    @staticmethod
-    def _linear_resample_int16(x_int16: np.ndarray, src_hz: int, dst_hz: int) -> np.ndarray:
-        """Very lightweight linear resample to reduce aliasing vs index stepping."""
-        if src_hz == dst_hz:
-            return x_int16
-        n_src = len(x_int16)
-        n_dst = int(n_src * dst_hz / src_hz)
-        if n_dst <= 0:
-            return np.zeros(0, dtype=np.int16)
-        src_idx = np.arange(n_src, dtype=np.float64)
-        dst_pos = np.linspace(0, n_src - 1, n_dst, endpoint=True)
-        y = np.interp(dst_pos, src_idx, x_int16.astype(np.float64))
-        y = np.clip(y, -32768, 32767).astype(np.int16)
-        return y
-
     def process_audio(self, pcm_data):
         """Accept float32 mono [-1,1] or int16 numpy array; pushes 16k int16 bytes into a thread-safe buffer."""
         if not self.asr_enabled or not self.running:
@@ -166,7 +166,7 @@ class GoogleASRProcessor:
                 pcm_16bit = (pcm_float * 32767).astype(np.int16)
 
             # Resample to 16 kHz linearly
-            pcm_16k = self._linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
+            pcm_16k = _linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
 
             try:
                 self.audio_buffer.put(pcm_16k.tobytes(), block=False)
@@ -400,21 +400,6 @@ class OpenAIRealtimeASRProcessor:
                 self.asr_task = None
             log("info", f"OpenAI Realtime ASR streaming stopped. Stats: {self.stats}")
 
-    @staticmethod
-    def _linear_resample_int16(x_int16: np.ndarray, src_hz: int, dst_hz: int) -> np.ndarray:
-        """Very lightweight linear resample to reduce aliasing vs index stepping."""
-        if src_hz == dst_hz:
-            return x_int16
-        n_src = len(x_int16)
-        n_dst = int(n_src * dst_hz / src_hz)
-        if n_dst <= 0:
-            return np.zeros(0, dtype=np.int16)
-        src_idx = np.arange(n_src, dtype=np.float64)
-        dst_pos = np.linspace(0, n_src - 1, n_dst, endpoint=True)
-        y = np.interp(dst_pos, src_idx, x_int16.astype(np.float64))
-        y = np.clip(y, -32768, 32767).astype(np.int16)
-        return y
-
     def process_audio(self, pcm_data):
         """Accept float32 mono [-1,1] or int16 numpy array; queue 24 kHz PCM16 bytes for ASR."""
         if not self.asr_enabled or not self.running:
@@ -434,7 +419,7 @@ class OpenAIRealtimeASRProcessor:
                 pcm_float = np.clip(pcm_float, -1.0, 1.0)
                 pcm_16bit = (pcm_float * 32767).astype(np.int16)
 
-            pcm_24k = self._linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
+            pcm_24k = _linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
 
             try:
                 self.audio_queue.put_nowait(pcm_24k.tobytes())
