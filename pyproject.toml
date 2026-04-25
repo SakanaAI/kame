@@ -24,7 +24,6 @@ readme = "README.md"
 [project.scripts]
 kame-server = "kame.server:cli"
 kame-server-oracle = "kame.server_oracle:cli"
-kame-server-oracle-openai-asr = "kame.server_oracle_openai_asr:cli"
 kame-inference = "kame.run_inference:cli"
 
 [tool.setuptools.dynamic]

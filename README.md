@@ -63,13 +63,13 @@ python -m kame.server --help
 ## Runtime Notes
 
 - `kame.server_oracle` requires `OPENAI_API_KEY`.
-- ASR is enabled by default and uses Google Cloud Speech-to-Text. Set
-  `GOOGLE_APPLICATION_CREDENTIALS` to a valid Google Cloud credential JSON file
-  before starting the server.
-- The current oracle-guided server path is configured for English dialogue and ASR (`en-US`).
+- ASR is enabled by default and uses OpenAI Realtime transcription
+  (`gpt-4o-mini-transcribe`). Use `--asr-provider google` to use Google Cloud
+  Speech-to-Text instead.
+- The current oracle-guided server path is configured for English dialogue and ASR.
 - If `--static` is omitted, the browser UI assets are fetched automatically at startup.
 - `kame.server_oracle` sends conversation text to OpenAI Chat Completions.
-- If ASR is enabled, `kame.server_oracle` sends audio to Google Cloud Speech-to-Text.
+- If ASR is enabled, `kame.server_oracle` sends audio to the selected ASR provider.
 - `kame.server_oracle` currently supports only a single active WebSocket session at a time; concurrent sessions are rejected with `503 Server busy`.
 - Plaintext local session logs are disabled by default. Enable them explicitly with `--log-dir` or `MOSHI_LOG_DIR` if you want to persist transcripts and token streams locally.
 
@@ -99,7 +99,6 @@ uv init --bare --python 3.12
 uv add "kame-model @ git+https://github.com/SakanaAI/kame.git@1a69ee29dbd201d400f841459d87871154881047"
 
 export OPENAI_API_KEY=...
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/google-cloud-credentials.json
 
 uv run python -m kame.server_oracle \
   --hf-repo SakanaAI/kame \
@@ -118,14 +117,15 @@ Notes:
 
 - Python `>=3.10` is supported; the command above uses Python 3.12 because it is
   the version used for verification.
-- `OPENAI_API_KEY` is required by `kame.server_oracle`.
-- ASR is enabled by default and requires Google Cloud Speech-to-Text. Before
-  running the server, set up a Google Cloud project for
+- `OPENAI_API_KEY` is required by `kame.server_oracle` and is used for both the
+  oracle LLM stream and the default OpenAI ASR provider.
+- To use Google Cloud Speech-to-Text instead of OpenAI ASR, set up a Google
+  Cloud project for
   [Speech-to-Text](https://cloud.google.com/speech-to-text/docs/setup) and
   configure
   [Application Default Credentials](https://cloud.google.com/docs/authentication/set-up-adc-on-premises)
-  with `GOOGLE_APPLICATION_CREDENTIALS`.
-- For local smoke tests without Google Speech-to-Text, pass `--no-enable-asr`.
+  with `GOOGLE_APPLICATION_CREDENTIALS`, then pass `--asr-provider google`.
+- For local smoke tests without ASR, pass `--no-enable-asr`.
   This skips ASR and does not exercise the full oracle-guided spoken-dialogue path.
 - `--config-path`, `--moshi-weight`, `--mimi-weight`, and `--tokenizer` are not
   needed for the public Hugging Face checkpoint in the usual case.
