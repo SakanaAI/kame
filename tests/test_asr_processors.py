@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from kame.asr_processors import (
@@ -11,6 +9,24 @@ from kame.asr_processors import (
     create_asr_processor,
     require_initialized_asr,
 )
+
+
+class DisabledASRProcessor:
+    asr_enabled = False
+    init_error = "missing credentials"
+    running = False
+
+    def register_callbacks(self, on_partial, on_final):
+        pass
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    def process_audio(self, pcm_data):
+        pass
 
 
 def test_create_openai_asr_processor_uses_openai_provider(monkeypatch) -> None:
@@ -50,7 +66,5 @@ def test_require_initialized_asr_allows_disabled_asr() -> None:
 
 
 def test_require_initialized_asr_raises_with_processor_init_error() -> None:
-    processor = SimpleNamespace(asr_enabled=False, init_error="missing credentials")
-
     with pytest.raises(RuntimeError, match="missing credentials"):
-        require_initialized_asr(enable_asr=True, asr_processor=processor)
+        require_initialized_asr(enable_asr=True, asr_processor=DisabledASRProcessor())
