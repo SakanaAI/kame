@@ -45,7 +45,7 @@ dev = [
     "pytest >= 8.3.3",
     "ruff>=0.14.9",
     "mypy>=1.19.1",
-    "pyright",
+    "pyright[nodejs]",
     "flake8",
     "pre-commit",
     "gradio-webrtc>=0.0.18",
@@ -53,7 +53,7 @@ dev = [
 
 [project.optional-dependencies]
 dev = [
-    "pyright",
+    "pyright[nodejs]",
     "pytest",
     "flake8",
     "pre-commit",
