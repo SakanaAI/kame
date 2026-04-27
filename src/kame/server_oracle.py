@@ -28,6 +28,13 @@ from .asr_processors import (
     DEFAULT_GOOGLE_ASR_LANGUAGE,
     DEFAULT_OPENAI_ASR_LANGUAGE,
     DEFAULT_OPENAI_ASR_MODEL,
+    DEFAULT_OPENAI_LOCAL_VAD_ENERGY_THRESHOLD,
+    DEFAULT_OPENAI_MANUAL_COMMIT,
+    DEFAULT_OPENAI_MANUAL_COMMIT_INTERVAL_MS,
+    DEFAULT_OPENAI_MANUAL_MIN_COMMIT_MS,
+    DEFAULT_OPENAI_MANUAL_PREFIX_PADDING_MS,
+    DEFAULT_OPENAI_MANUAL_SILENCE_DURATION_MS,
+    DEFAULT_OPENAI_MANUAL_START_DEBOUNCE_MS,
     create_asr_processor,
     require_initialized_asr,
 )
@@ -334,6 +341,7 @@ class ServerState:
         asr_provider: ASRProvider = DEFAULT_ASR_PROVIDER,
         asr_model: str = DEFAULT_OPENAI_ASR_MODEL,
         asr_language: str | None = None,
+        asr_options: dict[str, Any] | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -375,6 +383,7 @@ class ServerState:
                 sample_rate=int(self.mimi.sample_rate),
                 model=asr_model,
                 language=asr_language,
+                **(asr_options or {}),
             )
             if enable_asr
             else None
@@ -730,6 +739,72 @@ def main():
         ),
     )
     parser.add_argument(
+        "--openai-vad-threshold",
+        type=float,
+        default=0.5,
+        help="OpenAI server_vad activation threshold used when --asr-provider=openai.",
+    )
+    parser.add_argument(
+        "--openai-vad-prefix-padding-ms",
+        type=int,
+        default=240,
+        help="OpenAI server_vad prefix padding in milliseconds.",
+    )
+    parser.add_argument(
+        "--openai-vad-silence-duration-ms",
+        type=int,
+        default=240,
+        help="OpenAI server_vad silence duration in milliseconds.",
+    )
+    parser.add_argument(
+        "--openai-manual-commit",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_OPENAI_MANUAL_COMMIT,
+        help=(
+            "Disable OpenAI server VAD and manually commit audio chunks using local energy VAD "
+            f"(default: {DEFAULT_OPENAI_MANUAL_COMMIT}). Use --no-openai-manual-commit for server_vad."
+        ),
+    )
+    parser.add_argument(
+        "--openai-manual-commit-interval-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_COMMIT_INTERVAL_MS,
+        help="Target interval between manual OpenAI input_audio_buffer.commit events while speech is active.",
+    )
+    parser.add_argument(
+        "--openai-manual-min-commit-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_MIN_COMMIT_MS,
+        help="Minimum buffered audio duration for periodic manual OpenAI commits.",
+    )
+    parser.add_argument(
+        "--openai-manual-silence-duration-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_SILENCE_DURATION_MS,
+        help="Local silence duration that ends a manual OpenAI ASR utterance.",
+    )
+    parser.add_argument(
+        "--openai-manual-prefix-padding-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_PREFIX_PADDING_MS,
+        help="Local audio prefix padding included at the start of manual OpenAI ASR utterances.",
+    )
+    parser.add_argument(
+        "--openai-manual-start-debounce-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_START_DEBOUNCE_MS,
+        help=(
+            "Require this many milliseconds of consecutive local speech energy before starting "
+            "a manual OpenAI ASR utterance. Debounced audio is retained in the prefix buffer."
+        ),
+    )
+    parser.add_argument(
+        "--openai-local-vad-energy-threshold",
+        type=float,
+        default=DEFAULT_OPENAI_LOCAL_VAD_ENERGY_THRESHOLD,
+        help="RMS energy threshold for local VAD in OpenAI manual commit mode.",
+    )
+    parser.add_argument(
         "--ssl",
         type=str,
         help=(
@@ -750,6 +825,18 @@ def main():
     args = parser.parse_args()
     seed_all(42424242)
     configure_save_dir(args.log_dir or os.environ.get("MOSHI_LOG_DIR"))
+    openai_asr_options = {
+        "vad_threshold": args.openai_vad_threshold,
+        "vad_prefix_padding_ms": args.openai_vad_prefix_padding_ms,
+        "vad_silence_duration_ms": args.openai_vad_silence_duration_ms,
+        "manual_commit": args.openai_manual_commit,
+        "manual_commit_interval_ms": args.openai_manual_commit_interval_ms,
+        "manual_min_commit_ms": args.openai_manual_min_commit_ms,
+        "manual_silence_duration_ms": args.openai_manual_silence_duration_ms,
+        "manual_prefix_padding_ms": args.openai_manual_prefix_padding_ms,
+        "manual_start_debounce_ms": args.openai_manual_start_debounce_ms,
+        "local_vad_energy_threshold": args.openai_local_vad_energy_threshold,
+    }
 
     setup_tunnel = None
     tunnel_token = ""
@@ -798,6 +885,7 @@ def main():
         asr_provider=args.asr_provider,
         asr_model=args.asr_model,
         asr_language=args.asr_language,
+        asr_options=openai_asr_options,
         **checkpoint_info.lm_gen_config,
     )
     log("info", "warming up the model")
