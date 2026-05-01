@@ -69,7 +69,7 @@ class ServerState:
         self.lm_gen.streaming_forever(1)
 
     def warmup(self):
-        for chunk in range(4):
+        for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
             codes = self.mimi.encode(chunk)
             for c in range(codes.shape[-1]):
@@ -216,7 +216,7 @@ def main():
         action="store_false",
         dest="fuse_lora",
         default=True,
-        help="Do not fuse LoRA layers intot Linear layers.",
+        help="Do not fuse LoRA layers into Linear layers.",
     )
     parser.add_argument(
         "--half",
@@ -246,7 +246,7 @@ def main():
         except ImportError:
             log(
                 "error",
-                "Cannot find gradio which is required to activate a tunnel. Please install with `pip install gradio`.",
+                "Cannot find gradio which is required to activate a tunnel. Please install the optional tunnel support with `pip install 'kame-model[tunnel]'`.",
             )
             sys.exit(1)
         setup_tunnel = networking.setup_tunnel
