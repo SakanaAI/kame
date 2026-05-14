@@ -1,9 +1,19 @@
+import asyncio
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from kame import server_oracle
+
+
+class DummyServerState:
+    def __init__(self, pending_user_text: str = "") -> None:
+        self.pending_user_text = pending_user_text
+        self.llm_event_queue = asyncio.Queue()
+
+    def get_pending_user_text(self) -> str:
+        return self.pending_user_text
 
 
 def test_importing_server_oracle_does_not_create_logs_dir(tmp_path: Path) -> None:
@@ -58,3 +68,60 @@ def test_add_to_conversation_reuses_speaker_prefix_for_contiguous_chunks(tmp_pat
         server_oracle.SAVE_DIR = original_save_dir
         server_oracle.conversation_text = original_conversation_text
         server_oracle.current_speaker = original_current_speaker
+
+
+def test_llm_mux_prompt_includes_pending_user_text(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    original_conversation_text = server_oracle.conversation_text
+    original_current_speaker = server_oracle.current_speaker
+    try:
+        server_oracle.conversation_text = "moshi: hello "
+        server_oracle.current_speaker = "moshi"
+        mux = server_oracle.LLMStreamMultiplexer(
+            DummyServerState("I need help"),
+            system_prompt="system",
+            max_prompt_chars=1000,
+        )
+
+        messages, has_user_input = mux._build_messages_from_state()
+
+        assert has_user_input is True
+        assert messages == [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "moshi: hello\nuser: I need help "},
+        ]
+    finally:
+        server_oracle.conversation_text = original_conversation_text
+        server_oracle.current_speaker = original_current_speaker
+
+
+def test_llm_mux_adoption_does_not_roll_back_to_older_generation(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    mux = server_oracle.LLMStreamMultiplexer(DummyServerState(), system_prompt="system")
+    mux.adopted_gen = 4
+
+    asyncio.run(mux._adopt_generation(3))
+
+    assert mux.adopted_gen == 4
+
+
+def test_llm_mux_ignores_stale_session_start_tasks(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    mux = server_oracle.LLMStreamMultiplexer(DummyServerState("hello"), system_prompt="system")
+    started = False
+
+    async def fake_start_stream(*args, **kwargs) -> None:
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr(mux, "_start_stream", fake_start_stream)
+
+    async def run_stale_start() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        stale_session_id = mux._session_id
+        await mux.stop()
+        await mux._maybe_start_new_stream(force=True, session_id=stale_session_id)
+
+    asyncio.run(run_stale_start())
+
+    assert started is False
