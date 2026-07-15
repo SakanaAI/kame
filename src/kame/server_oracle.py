@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 from google.cloud import speech
 from ._tar_utils import extract_data_archive
 from .client_utils import log
+from .deferred_logging import DeferredSessionLogger
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
 
@@ -40,6 +41,7 @@ Since the output words will be spoken, do not include any symbols unrelated to p
 """.strip()
 
 ASR_LANGUAGE_CODE = "en-US"
+ORACLE_EVENT_APPLY_BUDGET_NS = 2_000_000
 
 # -----------------------
 # Global conversation state (thread-safe)
@@ -52,6 +54,7 @@ conversation_text = ""
 current_speaker = None
 conversation_lock = threading.Lock()
 SAVE_DIR: Optional[Path] = None
+SESSION_LOGGER: DeferredSessionLogger | None = None
 
 
 def configure_save_dir(log_dir: str | None) -> None:
@@ -67,6 +70,9 @@ def configure_save_dir(log_dir: str | None) -> None:
 
 def _append_session_log(filename: str, text: str) -> None:
     if SAVE_DIR is None:
+        return
+    if SESSION_LOGGER is not None and SESSION_LOGGER.active:
+        SESSION_LOGGER.append_text(filename, text)
         return
     with (SAVE_DIR / filename).open("a", encoding="utf-8") as f:
         f.write(text)
@@ -99,6 +105,8 @@ def add_to_conversation(speaker: str, text: str, flush_file: bool = True):
     text = text.strip()
     if not text:
         return
+    snapshot = None
+    save_dir = SAVE_DIR
     with conversation_lock:
         if speaker != current_speaker:
             if conversation_text and not conversation_text.endswith("\n"):
@@ -106,9 +114,14 @@ def add_to_conversation(speaker: str, text: str, flush_file: bool = True):
             conversation_text += f"{speaker}: "
             current_speaker = speaker
         conversation_text += f"{text} "
-        if flush_file:
-            if SAVE_DIR is not None:
-                (SAVE_DIR / "conversation.txt").write_text(conversation_text, encoding="utf-8")
+        if flush_file and save_dir is not None:
+            snapshot = conversation_text
+    if snapshot is not None:
+        if SESSION_LOGGER is not None and SESSION_LOGGER.active:
+            SESSION_LOGGER.replace_text("conversation.txt", snapshot)
+        else:
+            assert save_dir is not None
+            (save_dir / "conversation.txt").write_text(snapshot, encoding="utf-8")
 
 
 def get_conversation_snapshot() -> str:
@@ -180,6 +193,13 @@ class LLMStreamMultiplexer:
         self._start_lock = asyncio.Lock()
         self._running = False
         self._session_id = 0
+
+    def _hot_path_log(self, level: str, message: str) -> None:
+        session_logger = getattr(self.server_state, "session_logger", None)
+        if session_logger is not None and session_logger.active:
+            session_logger.console(level, message)
+        else:
+            log(level, message)
 
     def start_session(self, loop: asyncio.AbstractEventLoop) -> int:
         self.loop = loop
@@ -265,7 +285,7 @@ class LLMStreamMultiplexer:
 
         task = self.loop.create_task(self._stream_single(messages, gen_id, session_id))
         self._tasks[gen_id] = task
-        log("info", f"LLM started (gen {gen_id})")
+        self._hot_path_log("info", f"LLM started (gen {gen_id})")
 
         await self._enforce_stream_limit()
 
@@ -296,7 +316,7 @@ class LLMStreamMultiplexer:
             start_ts = self._start_ts.get(gen_id)
             if start_ts:
                 ttft = time.monotonic() - start_ts
-                log("info", f"LLM adopted (gen {gen_id}) TTFT={ttft:.3f}s")
+                self._hot_path_log("info", f"LLM adopted (gen {gen_id}) TTFT={ttft:.3f}s")
 
             await self._enforce_stream_limit()
 
@@ -715,6 +735,9 @@ class ServerState:
         self.device = device
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
+        self.session_logger = DeferredSessionLogger(SAVE_DIR)
+        global SESSION_LOGGER
+        SESSION_LOGGER = self.session_logger
 
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
@@ -781,7 +804,7 @@ class ServerState:
         if current_total_units > self._last_logged_total_units:
             units_added = current_total_units - self._last_logged_total_units
             self._last_logged_total_units = current_total_units
-            log("info", f"[ASR Partial +{units_added}] {text}")
+            self._hot_path_log("info", f"[ASR Partial +{units_added}] {text}")
             # Log ASR partial for visualization
             timestamp_ms = int(time.time() * 1000)
             _append_session_log("asr_partial.txt", f"{timestamp_ms}: {text}\n")
@@ -818,6 +841,12 @@ class ServerState:
             pass
 
     # ----------------------------------
+
+    def _hot_path_log(self, level: str, message: str) -> None:
+        if self.session_logger.active:
+            self.session_logger.console(level, message)
+        else:
+            log(level, message)
 
     def warmup(self):
         for _ in range(4):
@@ -884,9 +913,14 @@ class ServerState:
                 await asyncio.sleep(0.001)
 
                 # Drain LLM events and update oracle tokens BEFORE reading pcm.
+                drain_start_ns = time.perf_counter_ns()
+                drained_events = 0
                 try:
                     while True:
+                        if drained_events and time.perf_counter_ns() - drain_start_ns >= ORACLE_EVENT_APPLY_BUDGET_NS:
+                            break
                         event_type, gen_id, text = self.llm_event_queue.get_nowait()
+                        drained_events += 1
                         if event_type != "append" or not text:
                             continue
                         if gen_id < active_gen:
@@ -901,7 +935,7 @@ class ServerState:
 
                         token_ids = list(self.text_tokenizer.encode(text))  # type: ignore[attr-defined]
                         self.lm_gen.update_oracle_tokens_streaming(token_ids, reset=False)
-                        log("info", f"[LLM] {text}")
+                        self._hot_path_log("info", f"[LLM] {text}")
                         _append_session_log("oracle_stream.txt", f"{timestamp_ms}: {text}\n")
                         _append_session_log("llm_stream_words.txt", f"{timestamp_ms}: {text}\n")
                 except asyncio.QueueEmpty:
@@ -946,7 +980,7 @@ class ServerState:
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
-                            log("info", f"text token '{_text}'")
+                            self._hot_path_log("info", f"text token '{_text}'")
                             add_to_conversation("moshi", _text.strip(), flush_file=False)
                             timestamp_ms = int(time.time() * 1000)
                             _append_session_log("moshi_words.txt", f"{timestamp_ms}: {_text.strip()}\n")
@@ -985,6 +1019,8 @@ class ServerState:
                 # Stop any old LLM stream and drain old generation events.
                 await self._cleanup_llm_stream()
 
+                self.session_logger.start_session()
+
                 self.loop = asyncio.get_running_loop()
                 self.llm_mux.start_session(self.loop)
 
@@ -1018,6 +1054,7 @@ class ServerState:
                 await self._cleanup_llm_stream()
 
                 self.loop = None
+                self.session_logger.finish_session()
 
         log("info", "done with connection")
         return ws

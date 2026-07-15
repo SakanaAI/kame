@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from kame import server_oracle
+from kame.deferred_logging import DeferredSessionLogger
 
 
 class DummyServerState:
@@ -68,6 +69,25 @@ def test_add_to_conversation_reuses_speaker_prefix_for_contiguous_chunks(tmp_pat
         server_oracle.SAVE_DIR = original_save_dir
         server_oracle.conversation_text = original_conversation_text
         server_oracle.current_speaker = original_current_speaker
+
+
+def test_active_deferred_logger_writes_session_logs(tmp_path: Path, monkeypatch) -> None:
+    logger = DeferredSessionLogger(tmp_path, console_enabled=False)
+    monkeypatch.setattr(server_oracle, "SAVE_DIR", tmp_path)
+    monkeypatch.setattr(server_oracle, "SESSION_LOGGER", logger)
+    monkeypatch.setattr(server_oracle, "conversation_text", "")
+    monkeypatch.setattr(server_oracle, "current_speaker", None)
+
+    logger.start_session()
+    try:
+        server_oracle._append_session_log("oracle_stream.txt", "first\n")
+        server_oracle.add_to_conversation("user", "hello", flush_file=True)
+    finally:
+        summary = logger.finish_session()
+
+    assert (tmp_path / "oracle_stream.txt").read_text() == "first\n"
+    assert (tmp_path / "conversation.txt").read_text() == "user: hello "
+    assert summary["deferred_log_error_count"] == 0
 
 
 def test_llm_mux_prompt_includes_pending_user_text(monkeypatch) -> None:
