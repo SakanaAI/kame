@@ -3,6 +3,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from kame import server_oracle
 from kame.deferred_logging import DeferredSessionLogger
@@ -113,6 +116,41 @@ def test_llm_mux_prompt_includes_pending_user_text(monkeypatch) -> None:
     finally:
         server_oracle.conversation_text = original_conversation_text
         server_oracle.current_speaker = original_current_speaker
+
+
+@pytest.mark.parametrize("max_prompt_chars", [0, -1])
+def test_llm_mux_rejects_nonpositive_max_prompt_chars(max_prompt_chars: int) -> None:
+    with pytest.raises(ValueError, match="max_prompt_chars must be positive"):
+        server_oracle.LLMStreamMultiplexer(
+            DummyServerState(),
+            max_prompt_chars=max_prompt_chars,
+        )
+
+
+def test_llm_mux_strips_streamed_chunks_before_enqueue(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    state = DummyServerState()
+    mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
+
+    async def fake_stream():
+        for text in (" \n ", "\n Hello \n"):
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=text))],
+            )
+
+    async def fake_create(**_kwargs):
+        return fake_stream()
+
+    monkeypatch.setattr(mux.client.chat.completions, "create", fake_create)
+
+    async def run_stream() -> None:
+        session_id = mux.start_session(asyncio.get_running_loop())
+        await mux._stream_single([], gen_id=1, session_id=session_id)
+
+    asyncio.run(run_stream())
+
+    assert state.llm_event_queue.get_nowait() == ("append", 1, "Hello")
+    assert state.llm_event_queue.empty()
 
 
 def test_llm_mux_adoption_does_not_roll_back_to_older_generation(monkeypatch) -> None:

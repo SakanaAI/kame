@@ -167,6 +167,8 @@ class LLMStreamMultiplexer:
     ):
         self.server_state = server_state
         self.system_prompt = system_prompt
+        if max_prompt_chars <= 0:
+            raise ValueError("max_prompt_chars must be positive")
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError(
                 "OPENAI_API_KEY environment variable is not set. "
@@ -367,8 +369,8 @@ class LLMStreamMultiplexer:
                 if not (chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content):
                     continue
 
-                text = chunk.choices[0].delta.content or ""
-                if text.strip() == "":
+                text = (chunk.choices[0].delta.content or "").strip()
+                if not text:
                     continue
 
                 if not self._first_emit_ts.get(gen_id, 0.0):
