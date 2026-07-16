@@ -12,7 +12,6 @@ import secrets
 import sys
 import threading
 import collections
-import queue
 import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
@@ -21,8 +20,24 @@ import sentencepiece
 import sphn
 import torch
 from openai import AsyncOpenAI
-from google.cloud import speech
 from ._tar_utils import extract_data_archive
+from .asr_processors import (
+    ASRProvider,
+    ASRProcessor,
+    DEFAULT_ASR_PROVIDER,
+    DEFAULT_GOOGLE_ASR_LANGUAGE,
+    DEFAULT_OPENAI_ASR_LANGUAGE,
+    DEFAULT_OPENAI_ASR_MODEL,
+    DEFAULT_OPENAI_LOCAL_VAD_ENERGY_THRESHOLD,
+    DEFAULT_OPENAI_MANUAL_COMMIT,
+    DEFAULT_OPENAI_MANUAL_COMMIT_INTERVAL_MS,
+    DEFAULT_OPENAI_MANUAL_MIN_COMMIT_MS,
+    DEFAULT_OPENAI_MANUAL_PREFIX_PADDING_MS,
+    DEFAULT_OPENAI_MANUAL_SILENCE_DURATION_MS,
+    DEFAULT_OPENAI_MANUAL_START_DEBOUNCE_MS,
+    create_asr_processor,
+    require_initialized_asr,
+)
 from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
@@ -39,8 +54,6 @@ Your answer must be short and concise in maximum 30 words. Do not include moshi:
 Sometimes you as Moshi say incorrect things. Pay attention to the User's statements and provide correct information.
 Since the output words will be spoken, do not include any symbols unrelated to pronunciation (e.g., " ー ;). Avoid anything not relevant to pronunciation.
 """.strip()
-
-ASR_LANGUAGE_CODE = "en-US"
 
 # -----------------------
 # Global conversation state (thread-safe)
@@ -307,295 +320,6 @@ class LLMStreamManager:
             self.current_stream = None
 
 
-class AsyncASRProcessor:
-    """Async ASR with Google Speech-to-Text. Produces partial (pending) and final commits via callbacks.
-    Audio is pushed via process_audio(...) from the main audio loop thread.
-    """
-
-    def __init__(self, sample_rate=24000):
-        self.sample_rate = sample_rate
-        self.target_sample_rate = 16000  # Google Speech API requirement
-
-        self.audio_buffer = queue.Queue(maxsize=100)  # thread-safe
-        self.running = False
-        self.asr_task = None
-
-        # Stats
-        self.stats = {"words_detected": 0, "final_transcripts": 0, "buffer_drops": 0, "reconnections": 0}
-
-        # Google Speech
-        self.asr_enabled = False
-        self.init_error: str | None = None
-        self.speech_client = None
-        self.config = None
-        self.streaming_config = None
-
-        # Callbacks (set by ServerState)
-        self._on_partial = None
-        self._on_final = None
-
-        # Internals
-        self.stream_start_time = None
-        self.last_partial_text = ""
-
-        self._initialize_speech_client()
-
-    def register_callbacks(self, on_partial, on_final):
-        """Both are plain callables; they will schedule async work in the server loop."""
-        self._on_partial = on_partial
-        self._on_final = on_final
-
-    def _initialize_speech_client(self):
-        try:
-            if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-                self.init_error = "GOOGLE_APPLICATION_CREDENTIALS environment variable is not set."
-                return
-
-            self.speech_client = speech.SpeechClient()
-            language_code = ASR_LANGUAGE_CODE
-            self.config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=self.target_sample_rate,
-                language_code=language_code,
-                enable_automatic_punctuation=False,
-                enable_word_time_offsets=False,
-                enable_word_confidence=False,
-                use_enhanced=True,
-                metadata=speech.RecognitionMetadata(
-                    interaction_type=speech.RecognitionMetadata.InteractionType.VOICE_SEARCH,
-                    microphone_distance=speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
-                    recording_device_type=speech.RecognitionMetadata.RecordingDeviceType.PC,
-                ),
-            )
-            self.streaming_config = speech.StreamingRecognitionConfig(
-                config=self.config,
-                interim_results=True,
-                single_utterance=False,
-            )
-            self.asr_enabled = True
-            self.init_error = None
-            log("info", f"Async ASR processor initialized (language: {language_code})")
-        except Exception as e:
-            self.init_error = str(e)
-            log("warning", f"ASR initialization failed: {e}")
-
-    async def start(self):
-        if self.asr_enabled and not self.running:
-            self.running = True
-            self.asr_task = asyncio.create_task(self._run_asr_streaming())
-            log("info", "Async ASR streaming started")
-
-    async def stop(self):
-        if self.running:
-            self.running = False
-            try:
-                self.audio_buffer.put(None, block=False)  # signal end
-            except queue.Full:
-                # If the buffer is already full, we can rely on task cancellation below
-                # to stop the ASR loop; the explicit sentinel is not strictly required.
-                pass
-
-            if self.asr_task:
-                self.asr_task.cancel()
-                try:
-                    await self.asr_task
-                except asyncio.CancelledError:
-                    # Task cancellation is expected during cleanup; safe to ignore.
-                    pass
-            log("info", f"Async ASR streaming stopped. Stats: {self.stats}")
-
-    @staticmethod
-    def _linear_resample_int16(x_int16: np.ndarray, src_hz: int, dst_hz: int) -> np.ndarray:
-        """Very lightweight linear resample to reduce aliasing vs index stepping."""
-        if src_hz == dst_hz:
-            return x_int16
-        n_src = len(x_int16)
-        n_dst = int(n_src * dst_hz / src_hz)
-        if n_dst <= 0:
-            return np.zeros(0, dtype=np.int16)
-        src_idx = np.arange(n_src, dtype=np.float64)
-        dst_pos = np.linspace(0, n_src - 1, n_dst, endpoint=True)
-        y = np.interp(dst_pos, src_idx, x_int16.astype(np.float64))
-        y = np.clip(y, -32768, 32767).astype(np.int16)
-        return y
-
-    def process_audio(self, pcm_data):
-        """Accept float32 mono [-1,1] or int16 numpy array; pushes 16k int16 bytes into a thread-safe buffer."""
-        if not self.asr_enabled or not self.running:
-            return
-        try:
-            # Convert to int16
-            if isinstance(pcm_data, np.ndarray):
-                if pcm_data.dtype == np.float32:
-                    pcm_data = np.clip(pcm_data, -1.0, 1.0)
-                    pcm_16bit = (pcm_data * 32767).astype(np.int16)
-                elif pcm_data.dtype == np.int16:
-                    pcm_16bit = pcm_data
-                else:
-                    pcm_16bit = pcm_data.astype(np.int16)
-            else:
-                pcm_float = pcm_data.numpy() if hasattr(pcm_data, "numpy") else np.asarray(pcm_data, dtype=np.float32)
-                pcm_float = np.clip(pcm_float, -1.0, 1.0)
-                pcm_16bit = (pcm_float * 32767).astype(np.int16)
-
-            # Resample to 16 kHz linearly
-            pcm_16k = self._linear_resample_int16(pcm_16bit, self.sample_rate, self.target_sample_rate)
-
-            try:
-                self.audio_buffer.put(pcm_16k.tobytes(), block=False)
-            except queue.Full:
-                self.stats["buffer_drops"] += 1
-                try:
-                    _ = self.audio_buffer.get_nowait()
-                    self.audio_buffer.put(pcm_16k.tobytes(), block=False)
-                except Exception:
-                    # Best-effort buffer swap failed; drop this chunk silently.
-                    # This is rare and losing one audio chunk is acceptable.
-                    pass
-        except Exception as e:
-            log("error", f"Error processing audio: {e}")
-
-    async def _run_asr_streaming(self):
-        retry_count = 0
-        max_retries = 5
-
-        while self.running:
-            try:
-                self.stream_start_time = time.time()
-                # Run Google streaming in a worker thread (blocking)
-                await asyncio.to_thread(self._run_speech_streaming)
-                retry_count = 0
-                await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                log("info", "ASR streaming cancelled")
-                raise
-            except Exception as e:
-                if self.running:
-                    retry_count += 1
-                    self.stats["reconnections"] += 1
-                    log("error", f"ASR streaming error (retry {retry_count}/{max_retries}): {e}")
-                    if retry_count >= max_retries:
-                        log("warning", "Max retries reached, waiting before reset...")
-                        await asyncio.sleep(30)
-                        retry_count = 0
-                    else:
-                        await asyncio.sleep(min(retry_count * 0.5, 2.0))
-
-    def _run_speech_streaming(self):
-        try:
-
-            def audio_generator():
-                # 10ms at 16kHz, 2 bytes per sample -> 160 samples -> 320 bytes
-                min_chunk_size_bytes = 320
-                last_data_time = time.time()
-                while self.running:
-                    chunks = []
-                    total_size = 0
-                    try:
-                        chunk = self.audio_buffer.get(timeout=0.02)
-                        if chunk is None:
-                            return
-                        chunks.append(chunk)
-                        total_size += len(chunk)
-                        last_data_time = time.time()
-                    except queue.Empty:
-                        if time.time() - last_data_time > 5.0:
-                            log("warning", "No audio data for 5s, sending short silence")
-                            yield b"\x00" * 320  # ~10ms silence
-                            last_data_time = time.time()
-                        continue
-
-                    # Coalesce up to ~10ms
-                    deadline = time.time() + 0.01
-                    while total_size < min_chunk_size_bytes and time.time() < deadline:
-                        try:
-                            chunk = self.audio_buffer.get(timeout=0.005)
-                            if chunk is None:
-                                return
-                            chunks.append(chunk)
-                            total_size += len(chunk)
-                        except queue.Empty:
-                            break
-
-                    # Drain any residual without blocking
-                    while True:
-                        try:
-                            chunk = self.audio_buffer.get_nowait()
-                            if chunk is None:
-                                return
-                            chunks.append(chunk)
-                        except queue.Empty:
-                            break
-
-                    if chunks:
-                        yield b"".join(chunks)
-
-            requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in audio_generator())
-            if self.speech_client is None:
-                return
-            responses = self.speech_client.streaming_recognize(self.streaming_config, requests)
-            self._process_responses(responses)
-        except Exception as e:
-            if self.running:
-                raise e
-
-    def _process_responses(self, responses):
-        for response in responses:
-            if not self.running:
-                break
-            if not response.results:
-                continue
-
-            for result in response.results:
-                if not result.alternatives:
-                    continue
-
-                alternative = result.alternatives[0]
-                transcript = alternative.transcript.strip()
-                if not transcript:
-                    continue
-
-                # Emit partial (debounced: only if changed)
-                if not result.is_final:
-                    if transcript != self.last_partial_text:
-                        self.last_partial_text = transcript
-                        if self._on_partial:
-                            try:
-                                self._on_partial(transcript)
-                            except Exception:
-                                # Callback errors should not stop ASR streaming; ignore.
-                                pass
-                    continue
-
-                # Final result
-                self.last_partial_text = ""
-                self.stats["final_transcripts"] += 1
-                if self._on_final:
-                    try:
-                        self._on_final(transcript)
-                    except Exception:
-                        # Callback errors should not stop ASR streaming; ignore.
-                        pass
-
-
-def _require_initialized_asr(enable_asr: bool, asr_processor: Optional[AsyncASRProcessor]) -> None:
-    if not enable_asr:
-        return
-
-    if asr_processor is not None and asr_processor.asr_enabled:
-        return
-
-    reason = "unknown error"
-    if asr_processor is not None and asr_processor.init_error:
-        reason = asr_processor.init_error
-    raise RuntimeError(
-        "ASR is enabled but Google Speech-to-Text could not be initialized. "
-        f"{reason} "
-        "Set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account credential file "
-        "or rerun with --no-enable-asr."
-    )
-
-
 @dataclass
 class ServerState:
     model_type: str
@@ -603,7 +327,7 @@ class ServerState:
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
-    asr_processor: Optional[AsyncASRProcessor] = None
+    asr_processor: Optional[ASRProcessor] = None
 
     def __init__(
         self,
@@ -614,6 +338,10 @@ class ServerState:
         cfg_coef: float,
         device: str | torch.device,
         enable_asr: bool = True,
+        asr_provider: ASRProvider = DEFAULT_ASR_PROVIDER,
+        asr_model: str = DEFAULT_OPENAI_ASR_MODEL,
+        asr_language: str | None = None,
+        asr_options: dict[str, Any] | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -649,8 +377,18 @@ class ServerState:
         self.loop: asyncio.AbstractEventLoop | None = None
 
         # ASR processor
-        self.asr_processor = AsyncASRProcessor(sample_rate=int(self.mimi.sample_rate)) if enable_asr else None
-        _require_initialized_asr(enable_asr, self.asr_processor)
+        self.asr_processor = (
+            create_asr_processor(
+                provider=asr_provider,
+                sample_rate=int(self.mimi.sample_rate),
+                model=asr_model,
+                language=asr_language,
+                **(asr_options or {}),
+            )
+            if enable_asr
+            else None
+        )
+        require_initialized_asr(enable_asr, self.asr_processor)
 
         # LLM stream manager (uses oracle_queue; never touches lm_gen directly)
         self.llm_stream_manager = LLMStreamManager(
@@ -977,6 +715,96 @@ def main():
         help="Enable ASR processing for transcription (default: True)",
     )
     parser.add_argument(
+        "--asr-provider",
+        choices=("openai", "google"),
+        default=DEFAULT_ASR_PROVIDER,
+        help=f"ASR provider to use for transcription (default: {DEFAULT_ASR_PROVIDER}).",
+    )
+    parser.add_argument(
+        "--asr-model",
+        type=str,
+        default=DEFAULT_OPENAI_ASR_MODEL,
+        help=(
+            "OpenAI Realtime transcription model to use when --asr-provider=openai "
+            f"(default: {DEFAULT_OPENAI_ASR_MODEL})."
+        ),
+    )
+    parser.add_argument(
+        "--asr-language",
+        type=str,
+        default=None,
+        help=(
+            "ASR language code. Defaults to provider-specific values "
+            f"({DEFAULT_OPENAI_ASR_LANGUAGE} for OpenAI, {DEFAULT_GOOGLE_ASR_LANGUAGE} for Google)."
+        ),
+    )
+    parser.add_argument(
+        "--openai-vad-threshold",
+        type=float,
+        default=0.5,
+        help="OpenAI server_vad activation threshold used when --asr-provider=openai.",
+    )
+    parser.add_argument(
+        "--openai-vad-prefix-padding-ms",
+        type=int,
+        default=240,
+        help="OpenAI server_vad prefix padding in milliseconds.",
+    )
+    parser.add_argument(
+        "--openai-vad-silence-duration-ms",
+        type=int,
+        default=240,
+        help="OpenAI server_vad silence duration in milliseconds.",
+    )
+    parser.add_argument(
+        "--openai-manual-commit",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_OPENAI_MANUAL_COMMIT,
+        help=(
+            "Disable OpenAI server VAD and manually commit audio chunks using local energy VAD "
+            f"(default: {DEFAULT_OPENAI_MANUAL_COMMIT}). Use --no-openai-manual-commit for server_vad."
+        ),
+    )
+    parser.add_argument(
+        "--openai-manual-commit-interval-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_COMMIT_INTERVAL_MS,
+        help="Target interval between manual OpenAI input_audio_buffer.commit events while speech is active.",
+    )
+    parser.add_argument(
+        "--openai-manual-min-commit-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_MIN_COMMIT_MS,
+        help="Minimum buffered audio duration for periodic manual OpenAI commits.",
+    )
+    parser.add_argument(
+        "--openai-manual-silence-duration-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_SILENCE_DURATION_MS,
+        help="Local silence duration that ends a manual OpenAI ASR utterance.",
+    )
+    parser.add_argument(
+        "--openai-manual-prefix-padding-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_PREFIX_PADDING_MS,
+        help="Local audio prefix padding included at the start of manual OpenAI ASR utterances.",
+    )
+    parser.add_argument(
+        "--openai-manual-start-debounce-ms",
+        type=int,
+        default=DEFAULT_OPENAI_MANUAL_START_DEBOUNCE_MS,
+        help=(
+            "Require this many milliseconds of consecutive local speech energy before starting "
+            "a manual OpenAI ASR utterance. Debounced audio is retained in the prefix buffer."
+        ),
+    )
+    parser.add_argument(
+        "--openai-local-vad-energy-threshold",
+        type=float,
+        default=DEFAULT_OPENAI_LOCAL_VAD_ENERGY_THRESHOLD,
+        help="RMS energy threshold for local VAD in OpenAI manual commit mode.",
+    )
+    parser.add_argument(
         "--ssl",
         type=str,
         help=(
@@ -997,6 +825,18 @@ def main():
     args = parser.parse_args()
     seed_all(42424242)
     configure_save_dir(args.log_dir or os.environ.get("MOSHI_LOG_DIR"))
+    openai_asr_options = {
+        "vad_threshold": args.openai_vad_threshold,
+        "vad_prefix_padding_ms": args.openai_vad_prefix_padding_ms,
+        "vad_silence_duration_ms": args.openai_vad_silence_duration_ms,
+        "manual_commit": args.openai_manual_commit,
+        "manual_commit_interval_ms": args.openai_manual_commit_interval_ms,
+        "manual_min_commit_ms": args.openai_manual_min_commit_ms,
+        "manual_silence_duration_ms": args.openai_manual_silence_duration_ms,
+        "manual_prefix_padding_ms": args.openai_manual_prefix_padding_ms,
+        "manual_start_debounce_ms": args.openai_manual_start_debounce_ms,
+        "local_vad_energy_threshold": args.openai_local_vad_energy_threshold,
+    }
 
     setup_tunnel = None
     tunnel_token = ""
@@ -1042,6 +882,10 @@ def main():
         args.cfg_coef,
         args.device,
         enable_asr=args.enable_asr,
+        asr_provider=args.asr_provider,
+        asr_model=args.asr_model,
+        asr_language=args.asr_language,
+        asr_options=openai_asr_options,
         **checkpoint_info.lm_gen_config,
     )
     log("info", "warming up the model")
@@ -1084,7 +928,15 @@ def main():
 
     log("info", f"Access the Web UI directly at {protocol}://{args.host}:{args.port}")
     if args.enable_asr:
-        log("info", "ASR processing enabled (English) - partials stream to LLM; finals commit to transcript")
+        asr_detail = f"provider: {args.asr_provider}"
+        if args.asr_provider == "openai":
+            asr_detail += f", model: {args.asr_model}"
+        if args.asr_language:
+            asr_detail += f", language: {args.asr_language}"
+        log(
+            "info",
+            f"ASR processing enabled ({asr_detail}) - partials stream to LLM; finals commit to transcript",
+        )
     if setup_tunnel is not None:
         tunnel_kwargs = {}
         if "share_server_tls_certificate" in inspect.signature(setup_tunnel).parameters:
