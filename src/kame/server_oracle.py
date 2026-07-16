@@ -182,6 +182,10 @@ class LLMStreamMultiplexer:
 
         self.loop: asyncio.AbstractEventLoop | None = None
         self._last_start_ts = 0.0
+        self._trailing_start_handle: asyncio.TimerHandle | None = None
+        self._utterance_id = 0
+        self._latest_partial: tuple[int, str] | None = None
+        self._last_requested_partial: tuple[int, str] | None = None
 
         self._gen_counter = 0
         self._tasks: dict[int, asyncio.Task] = {}
@@ -204,42 +208,116 @@ class LLMStreamMultiplexer:
             log(level, message)
 
     def start_session(self, loop: asyncio.AbstractEventLoop) -> int:
+        self._cancel_trailing_start()
         self.loop = loop
         self._session_id += 1
         self._running = True
+        self._utterance_id = 0
+        self._latest_partial = None
+        self._last_requested_partial = None
         return self._session_id
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self.start_session(loop)
 
-    def on_interim_pending(self, _full_text: str):
+    @staticmethod
+    def _normalize_asr_text(text: str) -> str:
+        return " ".join(text.split())
+
+    def on_interim_pending(self, full_text: str) -> None:
         """Try to start a new stream at the fixed restart cadence."""
         loop = self.loop
         if not loop or not self._running:
             return
         session_id = self._session_id
-        loop.call_soon_threadsafe(
-            lambda: loop.create_task(self._maybe_start_new_stream(force=False, session_id=session_id))
-        )
+        normalized_text = self._normalize_asr_text(full_text)
 
-    def nudge_now(self, force: bool = True):
-        """Force-start immediately, used when a final ASR transcript lands."""
+        def schedule() -> None:
+            if not self._running or session_id != self._session_id:
+                return
+            utterance_id = self._utterance_id
+            self._latest_partial = (utterance_id, normalized_text)
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=False,
+                    session_id=session_id,
+                    partial_utterance_id=utterance_id,
+                )
+            )
+
+        loop.call_soon_threadsafe(schedule)
+
+    def on_final_committed(self, full_text: str) -> None:
+        """Start for new final text; otherwise keep the latest partial request."""
         loop = self.loop
         if not loop or not self._running:
             return
         session_id = self._session_id
-        loop.call_soon_threadsafe(
-            lambda: loop.create_task(self._maybe_start_new_stream(force=force, session_id=session_id))
-        )
+        normalized_text = self._normalize_asr_text(full_text)
+
+        def schedule() -> None:
+            if not self._running or session_id != self._session_id:
+                return
+            utterance_id = self._utterance_id
+            self._utterance_id += 1
+            self._cancel_trailing_start()
+
+            already_requested = self._last_requested_partial == (utterance_id, normalized_text)
+            self._latest_partial = None
+            self._last_requested_partial = None
+            if already_requested:
+                return
+
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=True,
+                    session_id=session_id,
+                    partial_utterance_id=None,
+                )
+            )
+
+        loop.call_soon_threadsafe(schedule)
 
     def _trim_prompt(self, text: str) -> str:
         if len(text) <= self.max_prompt_chars:
             return text
         return text[-self.max_prompt_chars :]
 
-    def _build_messages_from_state(self) -> tuple[list[dict[str, Any]], bool]:
+    def _cancel_trailing_start(self) -> None:
+        handle = self._trailing_start_handle
+        if handle is not None:
+            handle.cancel()
+            self._trailing_start_handle = None
+
+    def _schedule_trailing_start(self, *, delay: float, session_id: int, utterance_id: int) -> None:
+        loop = self.loop
+        if not loop or not self._running or session_id != self._session_id:
+            return
+
+        handle = self._trailing_start_handle
+        if handle is not None and not handle.cancelled():
+            return
+
+        def run_trailing_start() -> None:
+            self._trailing_start_handle = None
+            if not self._running or session_id != self._session_id or utterance_id != self._utterance_id:
+                return
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=False,
+                    session_id=session_id,
+                    partial_utterance_id=utterance_id,
+                )
+            )
+
+        self._trailing_start_handle = loop.call_later(max(0.0, delay), run_trailing_start)
+
+    def _build_messages_from_state(self, pending_text: str | None = None) -> tuple[list[dict[str, Any]], bool]:
         committed = get_conversation_snapshot().rstrip()
-        pending = self.server_state.get_pending_user_text().strip()
+        if pending_text is None:
+            pending_text = self.server_state.get_pending_user_text()
+        assert pending_text is not None
+        pending = pending_text.strip()
 
         has_user_input = False
         if pending:
@@ -256,22 +334,51 @@ class LLMStreamMultiplexer:
         ]
         return messages, has_user_input
 
-    async def _maybe_start_new_stream(self, *, force: bool, session_id: int):
+    async def _maybe_start_new_stream(
+        self,
+        *,
+        bypass_restart_interval: bool,
+        session_id: int,
+        partial_utterance_id: int | None,
+    ) -> None:
         if not self._running or session_id != self._session_id:
+            return
+        if partial_utterance_id is not None and partial_utterance_id != self._utterance_id:
             return
 
         async with self._start_lock:
             if not self._running or session_id != self._session_id:
                 return
-
-            now = time.monotonic()
-            if not force and (now - self._last_start_ts) < self.min_restart_interval:
+            if partial_utterance_id is not None and partial_utterance_id != self._utterance_id:
                 return
 
-            messages, has_user_input = self._build_messages_from_state()
+            requested_partial: tuple[int, str] | None = None
+            if partial_utterance_id is not None:
+                latest_partial = self._latest_partial
+                if latest_partial is None or latest_partial[0] != partial_utterance_id:
+                    return
+                requested_partial = latest_partial
+
+            messages, has_user_input = self._build_messages_from_state(
+                pending_text=requested_partial[1] if requested_partial is not None else None
+            )
             if not has_user_input:
                 return
 
+            now = time.monotonic()
+            elapsed = now - self._last_start_ts
+            if not bypass_restart_interval and elapsed < self.min_restart_interval:
+                assert partial_utterance_id is not None
+                self._schedule_trailing_start(
+                    delay=self.min_restart_interval - elapsed,
+                    session_id=session_id,
+                    utterance_id=partial_utterance_id,
+                )
+                return
+
+            self._cancel_trailing_start()
+            if requested_partial is not None:
+                self._last_requested_partial = requested_partial
             self._last_start_ts = now
             await self._start_stream(messages, session_id=session_id)
 
@@ -398,6 +505,7 @@ class LLMStreamMultiplexer:
     async def stop(self):
         self._running = False
         self._session_id += 1
+        self._cancel_trailing_start()
 
         for _, task in list(self._tasks.items()):
             if not task.done():
@@ -413,6 +521,9 @@ class LLMStreamMultiplexer:
         self._first_emit_ts.clear()
         self._start_ts.clear()
         self._last_start_ts = 0.0
+        self._utterance_id = 0
+        self._latest_partial = None
+        self._last_requested_partial = None
         self.loop = None
 
 
@@ -830,7 +941,7 @@ class ServerState:
             self._pending_user_text = ""
         self._max_pending_units = 0
         if text:
-            self.llm_mux.nudge_now(force=True)
+            self.llm_mux.on_final_committed(text)
 
     async def _cleanup_llm_stream(self):
         """Stop LLM streams and drain queued text to avoid leakage between sessions."""

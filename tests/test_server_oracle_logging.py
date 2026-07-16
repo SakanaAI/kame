@@ -20,6 +20,25 @@ class DummyServerState:
         return self.pending_user_text
 
 
+def _record_started_prompts(monkeypatch, mux) -> list[str]:
+    prompts: list[str] = []
+
+    async def record(messages, *, session_id) -> None:
+        del session_id
+        prompts.append(messages[-1]["content"])
+
+    monkeypatch.setattr(mux, "_start_stream", record)
+    return prompts
+
+
+async def _wait_for_prompt_count(prompts: list[str], count: int) -> None:
+    async def wait() -> None:
+        while len(prompts) < count:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=0.5)
+
+
 def test_importing_server_oracle_does_not_create_logs_dir(tmp_path: Path) -> None:
     env = os.environ.copy()
     env.pop("MOSHI_LOG_DIR", None)
@@ -178,8 +197,159 @@ def test_llm_mux_ignores_stale_session_start_tasks(monkeypatch) -> None:
         mux.start_session(asyncio.get_running_loop())
         stale_session_id = mux._session_id
         await mux.stop()
-        await mux._maybe_start_new_stream(force=True, session_id=stale_session_id)
+        await mux._maybe_start_new_stream(
+            bypass_restart_interval=True,
+            session_id=stale_session_id,
+            partial_utterance_id=None,
+        )
 
     asyncio.run(run_stale_start())
 
     assert started is False
+
+
+def test_llm_mux_starts_latest_partial_at_trailing_edge(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    state = DummyServerState("first partial")
+    mux = server_oracle.LLMStreamMultiplexer(
+        state,
+        system_prompt="system",
+        min_restart_interval=0.03,
+    )
+    started_prompts = _record_started_prompts(monkeypatch, mux)
+
+    async def run_starts() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        mux.on_interim_pending("first partial")
+        await _wait_for_prompt_count(started_prompts, 1)
+
+        state.pending_user_text = "intermediate partial"
+        mux.on_interim_pending("intermediate partial")
+        state.pending_user_text = "latest partial"
+        mux.on_interim_pending("latest partial")
+
+        await _wait_for_prompt_count(started_prompts, 2)
+        await mux.stop()
+
+    asyncio.run(run_starts())
+
+    assert len(started_prompts) == 2
+    assert started_prompts[0].endswith("user: first partial ")
+    assert started_prompts[1].endswith("user: latest partial ")
+
+
+def test_llm_mux_stop_cancels_trailing_partial_start(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    state = DummyServerState("first partial")
+    mux = server_oracle.LLMStreamMultiplexer(
+        state,
+        system_prompt="system",
+        min_restart_interval=0.03,
+    )
+    started_prompts = _record_started_prompts(monkeypatch, mux)
+
+    async def run_then_stop() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        mux.on_interim_pending("first partial")
+        await _wait_for_prompt_count(started_prompts, 1)
+
+        state.pending_user_text = "queued partial"
+        mux.on_interim_pending("queued partial")
+        await asyncio.sleep(0.005)
+        assert mux._trailing_start_handle is not None
+        await mux.stop()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run_then_stop())
+
+    assert len(started_prompts) == 1
+
+
+def test_llm_mux_deduplicates_final_after_intervening_moshi_output(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(server_oracle, "conversation_text", "moshi: hello ")
+    monkeypatch.setattr(server_oracle, "current_speaker", "moshi")
+    state = DummyServerState("I need help")
+    mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
+    started_prompts = _record_started_prompts(monkeypatch, mux)
+
+    async def run_partial_then_final() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        mux.on_interim_pending("I need help")
+        await _wait_for_prompt_count(started_prompts, 1)
+
+        server_oracle.conversation_text = "moshi: hello and more context \nuser: I need help "
+        server_oracle.current_speaker = "user"
+        state.pending_user_text = ""
+        mux.on_final_committed("I  need help")
+        await asyncio.sleep(0.01)
+        await mux.stop()
+
+    asyncio.run(run_partial_then_final())
+
+    assert len(started_prompts) == 1
+
+
+def test_llm_mux_starts_unrequested_final_and_cancels_trailing_start(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(server_oracle, "conversation_text", "moshi: hello ")
+    monkeypatch.setattr(server_oracle, "current_speaker", "moshi")
+    state = DummyServerState("I need help")
+    mux = server_oracle.LLMStreamMultiplexer(
+        state,
+        system_prompt="system",
+        min_restart_interval=0.03,
+    )
+    started_prompts = _record_started_prompts(monkeypatch, mux)
+
+    async def run_partial_then_final() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        mux.on_interim_pending("I need help")
+        await _wait_for_prompt_count(started_prompts, 1)
+
+        state.pending_user_text = "I need urgent help"
+        mux.on_interim_pending("I need urgent help")
+        await asyncio.sleep(0.005)
+        server_oracle.conversation_text = "moshi: hello \nuser: I need urgent help "
+        server_oracle.current_speaker = "user"
+        state.pending_user_text = ""
+        mux.on_final_committed("I need urgent help")
+        await _wait_for_prompt_count(started_prompts, 2)
+        assert mux._trailing_start_handle is None
+        await asyncio.sleep(0.05)
+        await mux.stop()
+
+    asyncio.run(run_partial_then_final())
+
+    assert len(started_prompts) == 2
+    assert started_prompts[1].endswith("user: I need urgent help")
+
+
+def test_llm_mux_does_not_deduplicate_same_text_across_utterances(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(server_oracle, "conversation_text", "")
+    monkeypatch.setattr(server_oracle, "current_speaker", None)
+    state = DummyServerState("hello")
+    mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
+    started_prompts = _record_started_prompts(monkeypatch, mux)
+
+    async def run_two_utterances() -> None:
+        mux.start_session(asyncio.get_running_loop())
+        mux.on_interim_pending("hello")
+        await _wait_for_prompt_count(started_prompts, 1)
+
+        server_oracle.conversation_text = "user: hello "
+        server_oracle.current_speaker = "user"
+        state.pending_user_text = ""
+        mux.on_final_committed("hello")
+        await asyncio.sleep(0.01)
+        assert len(started_prompts) == 1
+
+        server_oracle.conversation_text = "user: hello \nmoshi: hi \nuser: hello "
+        mux.on_final_committed("hello")
+        await _wait_for_prompt_count(started_prompts, 2)
+        await mux.stop()
+
+    asyncio.run(run_two_utterances())
+
+    assert len(started_prompts) == 2
