@@ -12,9 +12,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/SakanaAI/kame_finetune">KAME Finetuning</a> ·
+  <a href="https://github.com/SakanaAI/kame_finetune">KAME Finetuning code</a> ·
   <a href="https://arxiv.org/abs/2510.02327">Paper</a> ·
-  <a href="https://pub.sakana.ai/kame/">Blog post</a>
+  <a href="https://pub.sakana.ai/kame/">Blog post</a> ·
+  <a href="https://huggingface.co/SakanaAI/kame">Hugging Face</a>
+  
 </p>
 
 KAME is a spoken dialogue system built on top of the
