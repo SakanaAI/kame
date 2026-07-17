@@ -217,6 +217,31 @@ class LLMStreamMultiplexer:
         self._last_requested_partial = None
         return self._session_id
 
+    async def warmup_generation(self) -> None:
+        started_at = time.monotonic()
+        stream = None
+        try:
+            stream = await self.client.chat.completions.create(
+                model="gpt-4.1",
+                messages=[{"role": "user", "content": "Reply OK."}],
+                max_completion_tokens=1,
+                stream=True,
+            )
+            async for _ in stream:
+                pass
+        except Exception as error:
+            self._hot_path_log("warning", f"OpenAI generation warm-up failed: {error}")
+            return
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception as error:
+                    self._hot_path_log("warning", f"OpenAI warm-up stream close failed: {error}")
+
+        elapsed = time.monotonic() - started_at
+        self._hot_path_log("info", f"OpenAI generation warmed in {elapsed:.3f}s")
+
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self.start_session(loop)
 
@@ -1136,6 +1161,7 @@ class ServerState:
 
                 self.loop = asyncio.get_running_loop()
                 self.llm_mux.start_session(self.loop)
+                await self.llm_mux.warmup_generation()
 
                 # Register ASR callbacks (must be before start)
                 if self.asr_processor:

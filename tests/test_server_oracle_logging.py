@@ -137,6 +137,40 @@ def test_llm_mux_prompt_includes_pending_user_text(monkeypatch) -> None:
         server_oracle.current_speaker = original_current_speaker
 
 
+def test_llm_mux_warms_generation_without_enqueuing_output(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    state = DummyServerState()
+    mux = server_oracle.LLMStreamMultiplexer(state, system_prompt="system")
+    request_kwargs = None
+    stream_closed = False
+
+    class FakeStream:
+        async def __aiter__(self):
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="OK"))])
+
+        async def close(self) -> None:
+            nonlocal stream_closed
+            stream_closed = True
+
+    async def fake_create(**kwargs):
+        nonlocal request_kwargs
+        request_kwargs = kwargs
+        return FakeStream()
+
+    monkeypatch.setattr(mux.client.chat.completions, "create", fake_create)
+
+    asyncio.run(mux.warmup_generation())
+
+    assert request_kwargs == {
+        "model": "gpt-4.1",
+        "messages": [{"role": "user", "content": "Reply OK."}],
+        "max_completion_tokens": 1,
+        "stream": True,
+    }
+    assert stream_closed is True
+    assert state.llm_event_queue.empty()
+
+
 @pytest.mark.parametrize("max_prompt_chars", [0, -1])
 def test_llm_mux_rejects_nonpositive_max_prompt_chars(max_prompt_chars: int) -> None:
     with pytest.raises(ValueError, match="max_prompt_chars must be positive"):
