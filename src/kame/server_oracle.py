@@ -11,7 +11,6 @@ import time
 import secrets
 import sys
 import threading
-import collections
 import queue
 import aiohttp
 from aiohttp import web
@@ -24,6 +23,7 @@ from openai import AsyncOpenAI
 from google.cloud import speech
 from ._tar_utils import extract_data_archive
 from .client_utils import log
+from .deferred_logging import DeferredSessionLogger
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
 
@@ -41,6 +41,7 @@ Since the output words will be spoken, do not include any symbols unrelated to p
 """.strip()
 
 ASR_LANGUAGE_CODE = "en-US"
+ORACLE_EVENT_APPLY_BUDGET_NS = 2_000_000
 
 # -----------------------
 # Global conversation state (thread-safe)
@@ -53,6 +54,7 @@ conversation_text = ""
 current_speaker = None
 conversation_lock = threading.Lock()
 SAVE_DIR: Optional[Path] = None
+SESSION_LOGGER: DeferredSessionLogger | None = None
 
 
 def configure_save_dir(log_dir: str | None) -> None:
@@ -68,6 +70,9 @@ def configure_save_dir(log_dir: str | None) -> None:
 
 def _append_session_log(filename: str, text: str) -> None:
     if SAVE_DIR is None:
+        return
+    if SESSION_LOGGER is not None and SESSION_LOGGER.active:
+        SESSION_LOGGER.append_text(filename, text)
         return
     with (SAVE_DIR / filename).open("a", encoding="utf-8") as f:
         f.write(text)
@@ -100,6 +105,8 @@ def add_to_conversation(speaker: str, text: str, flush_file: bool = True):
     text = text.strip()
     if not text:
         return
+    snapshot = None
+    save_dir = SAVE_DIR
     with conversation_lock:
         if speaker != current_speaker:
             if conversation_text and not conversation_text.endswith("\n"):
@@ -107,14 +114,28 @@ def add_to_conversation(speaker: str, text: str, flush_file: bool = True):
             conversation_text += f"{speaker}: "
             current_speaker = speaker
         conversation_text += f"{text} "
-        if flush_file:
-            if SAVE_DIR is not None:
-                (SAVE_DIR / "conversation.txt").write_text(conversation_text, encoding="utf-8")
+        if flush_file and save_dir is not None:
+            snapshot = conversation_text
+    if snapshot is not None:
+        if SESSION_LOGGER is not None and SESSION_LOGGER.active:
+            SESSION_LOGGER.replace_text("conversation.txt", snapshot)
+        else:
+            assert save_dir is not None
+            (save_dir / "conversation.txt").write_text(snapshot, encoding="utf-8")
 
 
 def get_conversation_snapshot() -> str:
     with conversation_lock:
         return conversation_text
+
+
+def get_last_speaker(conversation_snapshot: str) -> str | None:
+    lines = conversation_snapshot.strip().split("\n")
+    for line in reversed(lines):
+        line = line.strip()
+        if line and ":" in line:
+            return line.split(":", 1)[0].strip()
+    return None
 
 
 def seed_all(seed):
@@ -128,183 +149,407 @@ def seed_all(seed):
     torch.backends.cudnn.benchmark = False
 
 
-class LLMStreamManager:
-    """Continuously (re)streams the LLM with debouncing and pushes text to the audio LM via an oracle queue.
+class LLMStreamMultiplexer:
+    """Starts overlapping LLM streams and adopts the first stream that emits.
 
-    Important: we NEVER call lm_gen directly from this class. We only put ('reset'|'append', payload) into oracle_queue.
-    The audio loop is the single writer to lm_gen to avoid race conditions.
+    The audio loop is still the only writer to lm_gen. This class only enqueues
+    generation-tagged text events for opus_loop to apply.
     """
 
-    def __init__(self, server_state, interval=0.25, system_prompt=""):
+    def __init__(
+        self,
+        server_state,
+        system_prompt: str = "",
+        *,
+        min_restart_interval: float = 0.50,
+        max_prompt_chars: int = 6000,
+        max_concurrent_streams: int = 7,
+    ):
         self.server_state = server_state
-        self.interval = interval
         self.system_prompt = system_prompt
-        self.current_stream = None
-        self.running = False
-
-        # Validate that the OpenAI API key is available at initialization time
+        if max_prompt_chars <= 0:
+            raise ValueError("max_prompt_chars must be positive")
         if not os.getenv("OPENAI_API_KEY"):
             raise RuntimeError(
                 "OPENAI_API_KEY environment variable is not set. "
                 "Set it before starting the server to enable LLM streaming."
             )
-        self.client = AsyncOpenAI()  # API key taken from environment
+        self.client = AsyncOpenAI()
 
-        # Debounce / restart control
-        self.last_start_time = 0.0
-        self.restart_history = collections.deque(maxlen=10)  # timestamps
+        self.min_restart_interval = float(min_restart_interval)
+        self.max_prompt_chars = max_prompt_chars
+        self.max_concurrent_streams = max(1, int(max_concurrent_streams))
 
-        # Cumulative word count tracking (handles partial text sliding window)
-        self.last_start_total_units = 0
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._last_start_ts = 0.0
+        self._trailing_start_handle: asyncio.TimerHandle | None = None
+        self._utterance_id = 0
+        self._latest_partial: tuple[int, str] | None = None
+        self._last_requested_partial: tuple[int, str] | None = None
 
-        self.min_units_delta = 2  # Require 2+ new words before restart
-        self.max_restarts_per_2s = 5
+        self._gen_counter = 0
+        self._tasks: dict[int, asyncio.Task] = {}
 
-    def _count_units(self, text: str) -> int:
-        """Count whitespace-delimited words."""
-        if not text or not text.strip():
-            return 0
-        return len(text.split())
+        self.adopted_gen = 0
+        self._first_emit_ts: dict[int, float] = {}
+        self._start_ts: dict[int, float] = {}
+        self._latest_gen = 0
 
-    def _restart_allowed(self) -> bool:
-        now = time.time()
-        # keep only the last 2 seconds
-        while self.restart_history and now - self.restart_history[0] > 2.0:
-            self.restart_history.popleft()
-        return len(self.restart_history) < self.max_restarts_per_2s
+        self._adopt_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._running = False
+        self._session_id = 0
 
-    async def run_periodic_streaming(self):
-        """Polls pending user text and (re)starts the LLM stream when it grows meaningfully or finalizes."""
-        while self.running:
-            try:
-                await asyncio.sleep(self.interval)
+    def _hot_path_log(self, level: str, message: str) -> None:
+        session_logger = getattr(self.server_state, "session_logger", None)
+        if session_logger is not None and session_logger.active:
+            session_logger.console(level, message)
+        else:
+            log(level, message)
 
-                # Snapshot state
-                pending = self.server_state.get_pending_user_text()
-                finalized_bump = self.server_state.consume_and_clear_final_bump()
-                committed_conv = get_conversation_snapshot()  # Full conversation (user + moshi)
+    def start_session(self, loop: asyncio.AbstractEventLoop) -> int:
+        self._cancel_trailing_start()
+        self.loop = loop
+        self._session_id += 1
+        self._running = True
+        self._utterance_id = 0
+        self._latest_partial = None
+        self._last_requested_partial = None
+        return self._session_id
 
-                # Calculate cumulative USER word count (ASR only, excludes moshi output)
-                # This prevents LLM restarts when moshi speaks
-                committed_units_asr = self.server_state._committed_units_asr
-                pending_units = self._count_units(pending) if pending else 0
-                max_pending = max(pending_units, self.server_state._max_pending_units)
-                current_total_units = committed_units_asr + max_pending
-
-                # Decide whether to (re)start
-                need_restart = False
-                if self.current_stream is None:
-                    # Start as soon as there's anything pending or after any finalization.
-                    need_restart = (len(pending.strip()) > 0) or finalized_bump
-                else:
-                    # Restart only if cumulative USER word count grew significantly or finalization
-                    units_added = current_total_units - self.last_start_total_units
-                    if units_added >= self.min_units_delta or finalized_bump:
-                        need_restart = True
-
-                if need_restart and self._restart_allowed():
-                    if self.current_stream:
-                        self.current_stream.cancel()
-                        self.current_stream = None
-                    self.restart_history.append(time.time())
-                    self.current_stream = asyncio.create_task(self._stream_llm_response(committed_conv, pending))
-                    self.last_start_total_units = current_total_units
-                    self.last_start_time = time.time()
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log("error", f"LLM periodic loop error: {e}")
-
-    def _build_messages(self, committed_conversation: str, pending_user_text: str) -> list[dict[str, Any]]:
-        # Provide the LLM with the whole conversation and the *current* pending user text.
-        convo = committed_conversation.rstrip()
-        if pending_user_text.strip():
-            if not convo.endswith("\n"):
-                convo += "\n"
-            convo += f"user: {pending_user_text.strip()} "
-        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": convo}]
-        return messages
-
-    async def _stream_llm_response(self, committed_conversation, pending_user_text):
-        """Stream LLM tokens and enqueue oracle updates. Audio loop is the single writer to lm_gen."""
-        stream_start_ms = int(time.time() * 1000)  # Timestamp for this entire stream session
-        stream_tokens = []  # Collect all tokens in this stream session for logging
+    async def warmup_generation(self) -> None:
+        started_at = time.monotonic()
+        stream = None
         try:
-            messages: list[dict[str, Any]] = self._build_messages(committed_conversation, pending_user_text)
+            stream = await self.client.chat.completions.create(
+                model="gpt-4.1",
+                messages=[{"role": "user", "content": "Reply OK."}],
+                max_completion_tokens=1,
+                stream=True,
+            )
+            async for _ in stream:
+                pass
+        except Exception as error:
+            self._hot_path_log("warning", f"OpenAI generation warm-up failed: {error}")
+            return
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception as error:
+                    self._hot_path_log("warning", f"OpenAI warm-up stream close failed: {error}")
+
+        elapsed = time.monotonic() - started_at
+        self._hot_path_log("info", f"OpenAI generation warmed in {elapsed:.3f}s")
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop):
+        self.start_session(loop)
+
+    @staticmethod
+    def _normalize_asr_text(text: str) -> str:
+        return " ".join(text.split())
+
+    def on_interim_pending(self, full_text: str) -> None:
+        """Try to start a new stream at the fixed restart cadence."""
+        loop = self.loop
+        if not loop or not self._running:
+            return
+        session_id = self._session_id
+        normalized_text = self._normalize_asr_text(full_text)
+
+        def schedule() -> None:
+            if not self._running or session_id != self._session_id:
+                return
+            utterance_id = self._utterance_id
+            self._latest_partial = (utterance_id, normalized_text)
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=False,
+                    session_id=session_id,
+                    partial_utterance_id=utterance_id,
+                )
+            )
+
+        loop.call_soon_threadsafe(schedule)
+
+    def on_final_committed(self, full_text: str) -> None:
+        """Start for new final text; otherwise keep the latest partial request."""
+        loop = self.loop
+        if not loop or not self._running:
+            return
+        session_id = self._session_id
+        normalized_text = self._normalize_asr_text(full_text)
+
+        def schedule() -> None:
+            if not self._running or session_id != self._session_id:
+                return
+            utterance_id = self._utterance_id
+            self._utterance_id += 1
+            self._cancel_trailing_start()
+
+            already_requested = self._last_requested_partial == (utterance_id, normalized_text)
+            self._latest_partial = None
+            self._last_requested_partial = None
+            if already_requested:
+                return
+
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=True,
+                    session_id=session_id,
+                    partial_utterance_id=None,
+                )
+            )
+
+        loop.call_soon_threadsafe(schedule)
+
+    def _trim_prompt(self, text: str) -> str:
+        if len(text) <= self.max_prompt_chars:
+            return text
+        return text[-self.max_prompt_chars :]
+
+    def _cancel_trailing_start(self) -> None:
+        handle = self._trailing_start_handle
+        if handle is not None:
+            handle.cancel()
+            self._trailing_start_handle = None
+
+    def _schedule_trailing_start(self, *, delay: float, session_id: int, utterance_id: int) -> None:
+        loop = self.loop
+        if not loop or not self._running or session_id != self._session_id:
+            return
+
+        handle = self._trailing_start_handle
+        if handle is not None and not handle.cancelled():
+            return
+
+        def run_trailing_start() -> None:
+            self._trailing_start_handle = None
+            if not self._running or session_id != self._session_id or utterance_id != self._utterance_id:
+                return
+            loop.create_task(
+                self._maybe_start_new_stream(
+                    bypass_restart_interval=False,
+                    session_id=session_id,
+                    partial_utterance_id=utterance_id,
+                )
+            )
+
+        self._trailing_start_handle = loop.call_later(max(0.0, delay), run_trailing_start)
+
+    def _build_messages_from_state(self, pending_text: str | None = None) -> tuple[list[dict[str, Any]], bool]:
+        committed = get_conversation_snapshot().rstrip()
+        if pending_text is None:
+            pending_text = self.server_state.get_pending_user_text()
+        assert pending_text is not None
+        pending = pending_text.strip()
+
+        has_user_input = False
+        if pending:
+            if committed and not committed.endswith("\n"):
+                committed += "\n"
+            committed += f"user: {pending} "
+            has_user_input = True
+        else:
+            has_user_input = get_last_speaker(committed) == "user"
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self._trim_prompt(committed)},
+        ]
+        return messages, has_user_input
+
+    async def _maybe_start_new_stream(
+        self,
+        *,
+        bypass_restart_interval: bool,
+        session_id: int,
+        partial_utterance_id: int | None,
+    ) -> None:
+        if not self._running or session_id != self._session_id:
+            return
+        if partial_utterance_id is not None and partial_utterance_id != self._utterance_id:
+            return
+
+        async with self._start_lock:
+            if not self._running or session_id != self._session_id:
+                return
+            if partial_utterance_id is not None and partial_utterance_id != self._utterance_id:
+                return
+
+            requested_partial: tuple[int, str] | None = None
+            if partial_utterance_id is not None:
+                latest_partial = self._latest_partial
+                if latest_partial is None or latest_partial[0] != partial_utterance_id:
+                    return
+                requested_partial = latest_partial
+
+            messages, has_user_input = self._build_messages_from_state(
+                pending_text=requested_partial[1] if requested_partial is not None else None
+            )
+            if not has_user_input:
+                return
+
+            now = time.monotonic()
+            elapsed = now - self._last_start_ts
+            if not bypass_restart_interval and elapsed < self.min_restart_interval:
+                assert partial_utterance_id is not None
+                self._schedule_trailing_start(
+                    delay=self.min_restart_interval - elapsed,
+                    session_id=session_id,
+                    utterance_id=partial_utterance_id,
+                )
+                return
+
+            self._cancel_trailing_start()
+            if requested_partial is not None:
+                self._last_requested_partial = requested_partial
+            self._last_start_ts = now
+            await self._start_stream(messages, session_id=session_id)
+
+    async def _start_stream(self, messages: list[dict[str, Any]], *, session_id: int):
+        if not self._running or session_id != self._session_id:
+            return
+        assert self.loop is not None
+
+        self._gen_counter += 1
+        gen_id = self._gen_counter
+        self._start_ts[gen_id] = time.monotonic()
+        self._first_emit_ts[gen_id] = 0.0
+
+        task = self.loop.create_task(self._stream_single(messages, gen_id, session_id))
+        self._tasks[gen_id] = task
+        self._hot_path_log("info", f"LLM started (gen {gen_id})")
+
+        await self._enforce_stream_limit()
+
+    async def _adopt_generation(self, gen_id: int):
+        """Adopt gen_id as the active stream when it emits its first token."""
+        async with self._adopt_lock:
+            if gen_id <= self.adopted_gen:
+                return
+
+            try:
+                while True:
+                    self.server_state.llm_event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+
+            for gid, task in list(self._tasks.items()):
+                if gid < gen_id and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    self._tasks.pop(gid, None)
+
+            self.adopted_gen = gen_id
+            self._latest_gen = gen_id
+
+            start_ts = self._start_ts.get(gen_id)
+            if start_ts:
+                ttft = time.monotonic() - start_ts
+                self._hot_path_log("info", f"LLM adopted (gen {gen_id}) TTFT={ttft:.3f}s")
+
+            await self._enforce_stream_limit()
+
+    async def _enforce_stream_limit(self):
+        live = [(gid, task) for gid, task in self._tasks.items() if not task.done()]
+        if len(live) <= self.max_concurrent_streams:
+            return
+
+        live_gids = {gid for gid, _ in live}
+        keep: set[int] = set()
+        if self.adopted_gen in live_gids:
+            keep.add(self.adopted_gen)
+
+        not_emitting_newest = [
+            gid
+            for gid, _ in sorted(live, key=lambda item: item[0], reverse=True)
+            if self._first_emit_ts.get(gid, 0.0) == 0.0 and gid != self.adopted_gen
+        ]
+        budget = self.max_concurrent_streams - len(keep)
+        if budget > 0:
+            keep.update(not_emitting_newest[:budget])
+
+        for gid, task in live:
+            if gid in keep or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._tasks.pop(gid, None)
+
+    async def _stream_single(self, messages: list[dict[str, Any]], gen_id: int, session_id: int):
+        try:
+            if not self._running or session_id != self._session_id:
+                return
+
             stream = await self.client.chat.completions.create(
                 model="gpt-4.1",
                 messages=messages,  # type: ignore[arg-type]
                 stream=True,
             )
-            first_chunk = True
+
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    chunk_text = chunk.choices[0].delta.content
-                    stripped_text = chunk_text.strip()
-                    if not stripped_text:
+                if not self._running or session_id != self._session_id:
+                    return
+
+                if not (chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content):
+                    continue
+
+                text = (chunk.choices[0].delta.content or "").strip()
+                if not text:
+                    continue
+
+                if not self._first_emit_ts.get(gen_id, 0.0):
+                    self._first_emit_ts[gen_id] = time.monotonic()
+                    if gen_id > self.adopted_gen:
+                        await self._adopt_generation(gen_id)
+                    else:
                         continue
 
-                    if first_chunk:
-                        # Issue a reset to the oracle at the very beginning of a new run
-                        try:
-                            self.server_state.oracle_queue.put_nowait(("reset", ""))
-                        except asyncio.QueueFull:
-                            # Reset is important but not strictly critical - the next LLM restart
-                            # will issue another reset. Log for monitoring purposes.
-                            log("warning", "Oracle queue full; reset command dropped (will retry on next restart)")
-                            pass
-                        first_chunk = False
+                if gen_id != self.adopted_gen:
+                    continue
 
-                    # Log all LLM tokens for debugging (regardless of queue status)
-                    stream_tokens.append(stripped_text)
-                    log("info", f"[LLM] {stripped_text}")
+                if not self._running or session_id != self._session_id:
+                    return
 
-                    # Append chunk to oracle via queue
-                    try:
-                        self.server_state.oracle_queue.put_nowait(("append", stripped_text))
-                    except asyncio.QueueFull:
-                        # If congested, we drop tiny chunks. Oracle will catch up next restart.
-                        log("warning", "Oracle queue full; dropping small LLM chunk.")
+                await self.server_state.llm_event_queue.put(("append", gen_id, text))
 
-            # Write all tokens from this stream session with the same timestamp
-            if stream_tokens:
-                _append_session_log("llm_stream_words.txt", f"{stream_start_ms}: {' '.join(stream_tokens)}\n")
         except asyncio.CancelledError:
-            log("info", "LLM stream cancelled")
-            # Log cancelled stream tokens with [CANCELLED] marker
-            if stream_tokens:
-                _append_session_log(
-                    "llm_stream_words.txt",
-                    f"{stream_start_ms}: [CANCELLED] {' '.join(stream_tokens)}\n",
-                )
             raise
         except Exception as e:
-            log("error", f"LLM streaming error: {e}")
-            # Log error stream tokens with [ERROR] marker
-            if stream_tokens:
-                _append_session_log(
-                    "llm_stream_words.txt",
-                    f"{stream_start_ms}: [ERROR] {' '.join(stream_tokens)}\n",
-                )
+            log("error", f"LLM gen {gen_id} streaming error: {e}")
+        finally:
+            self._tasks.pop(gen_id, None)
 
     async def stop(self):
-        """Stop the LLM stream manager and cancel any running stream.
+        self._running = False
+        self._session_id += 1
+        self._cancel_trailing_start()
 
-        This ensures both the periodic loop and any active LLM stream are properly
-        cancelled to prevent token leakage between sessions.
-        """
-        self.running = False
-
-        # Cancel the current LLM stream if running
-        if self.current_stream is not None:
-            self.current_stream.cancel()
-            try:
-                await self.current_stream
-            except asyncio.CancelledError:
-                # Task cancellation is expected during cleanup; safe to ignore.
-                pass
-            self.current_stream = None
+        for _, task in list(self._tasks.items()):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._tasks.clear()
+        self._gen_counter = 0
+        self.adopted_gen = 0
+        self._latest_gen = 0
+        self._first_emit_ts.clear()
+        self._start_ts.clear()
+        self._last_start_ts = 0.0
+        self._utterance_id = 0
+        self._latest_partial = None
+        self._last_requested_partial = None
+        self.loop = None
 
 
 class AsyncASRProcessor:
@@ -614,6 +859,9 @@ class ServerState:
         cfg_coef: float,
         device: str | torch.device,
         enable_asr: bool = True,
+        min_restart_interval: float = 0.50,
+        max_prompt_chars: int = 6000,
+        max_concurrent_streams: int = 7,
         **kwargs,
     ):
         self.model_type = model_type
@@ -625,23 +873,25 @@ class ServerState:
         self.device = device
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lock = asyncio.Lock()
+        self.session_logger = DeferredSessionLogger(SAVE_DIR)
+        global SESSION_LOGGER
+        SESSION_LOGGER = self.session_logger
 
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
 
-        # Oracle queue: single writer to lm_gen lives in opus_loop
-        self.oracle_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        # LLM text events from the multiplexer. opus_loop is the only lm_gen writer.
+        self.llm_event_queue: asyncio.Queue[tuple[str, int, str]] = asyncio.Queue(maxsize=256)
 
         # Pending ASR text (not yet committed to conversation)
         self._pending_user_text = ""
         self._pending_lock = asyncio.Lock()
-        self._final_bump_flag = False  # Set when final transcript lands
 
         # Cumulative word count for ASR partial logging (only log when words increase)
         self._last_logged_total_units = 0
 
-        # Cumulative ASR word count (user words only, excludes moshi output)
-        # Used for LLM restart decisions to avoid restarting when moshi speaks
+        # ASR word count state for partial logging and diagnostics.
+        # Counts user words only and excludes moshi output.
         self._max_pending_units = 0
         self._committed_units_asr = 0
 
@@ -652,23 +902,18 @@ class ServerState:
         self.asr_processor = AsyncASRProcessor(sample_rate=int(self.mimi.sample_rate)) if enable_asr else None
         _require_initialized_asr(enable_asr, self.asr_processor)
 
-        # LLM stream manager (uses oracle_queue; never touches lm_gen directly)
-        self.llm_stream_manager = LLMStreamManager(
+        # Parallel LLM stream multiplexer. It never touches lm_gen directly.
+        self.llm_mux = LLMStreamMultiplexer(
             server_state=self,
-            interval=0.5,
             system_prompt=SYSTEM_PROMPT,
+            min_restart_interval=min_restart_interval,
+            max_prompt_chars=max_prompt_chars,
+            max_concurrent_streams=max_concurrent_streams,
         )
-        self.llm_stream_task = None
 
     # ----- Pending user text API -----
     def get_pending_user_text(self) -> str:
         return self._pending_user_text
-
-    def consume_and_clear_final_bump(self) -> bool:
-        if self._final_bump_flag:
-            self._final_bump_flag = False
-            return True
-        return False
 
     def _asr_on_partial(self, text: str):
         # Called from a worker thread; schedule into event loop
@@ -697,10 +942,12 @@ class ServerState:
         if current_total_units > self._last_logged_total_units:
             units_added = current_total_units - self._last_logged_total_units
             self._last_logged_total_units = current_total_units
-            log("info", f"[ASR Partial +{units_added}] {text}")
+            self._hot_path_log("info", f"[ASR Partial +{units_added}] {text}")
             # Log ASR partial for visualization
             timestamp_ms = int(time.time() * 1000)
             _append_session_log("asr_partial.txt", f"{timestamp_ms}: {text}\n")
+
+        self.llm_mux.on_interim_pending(text)
 
     def _asr_on_final(self, text: str):
         if self.loop is not None:
@@ -717,30 +964,27 @@ class ServerState:
             _append_session_log("user_words.txt", f"{timestamp_ms}: {text}\n")
         async with self._pending_lock:
             self._pending_user_text = ""
-        self._final_bump_flag = True
         self._max_pending_units = 0
+        if text:
+            self.llm_mux.on_final_committed(text)
 
     async def _cleanup_llm_stream(self):
-        """Stop LLM stream manager and cancel the periodic task."""
-        await self.llm_stream_manager.stop()
-        if self.llm_stream_task:
-            self.llm_stream_task.cancel()
-            try:
-                await self.llm_stream_task
-            except asyncio.CancelledError:
-                # Task cancellation is expected during cleanup; safe to ignore.
-                pass
-            self.llm_stream_task = None
-
-        # Drain oracle queue to prevent token leakage between sessions
+        """Stop LLM streams and drain queued text to avoid leakage between sessions."""
+        await self.llm_mux.stop()
         try:
             while True:
-                self.oracle_queue.get_nowait()
+                self.llm_event_queue.get_nowait()
         except asyncio.QueueEmpty:
             # Queue is empty; draining complete.
             pass
 
     # ----------------------------------
+
+    def _hot_path_log(self, level: str, message: str) -> None:
+        if self.session_logger.active:
+            self.session_logger.console(level, message)
+        else:
+            log(level, message)
 
     def warmup(self):
         for _ in range(4):
@@ -796,27 +1040,42 @@ class ServerState:
                 log("info", "connection closed (recv_loop)")
 
         async def opus_loop():
-            """Single owner of lm_gen operations. It drains oracle_queue and calls update_oracle_tokens_streaming here."""
+            """Single owner of lm_gen operations. It drains LLM events and updates oracle tokens here."""
             all_pcm_data = None
             skip_frames = 1
+            active_gen = 0
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
 
-                # Drain oracle_queue and update oracle tokens BEFORE reading pcm
+                # Drain LLM events and update oracle tokens BEFORE reading pcm.
+                drain_start_ns = time.perf_counter_ns()
+                drained_events = 0
                 try:
                     while True:
-                        action, payload = self.oracle_queue.get_nowait()
+                        if drained_events and time.perf_counter_ns() - drain_start_ns >= ORACLE_EVENT_APPLY_BUDGET_NS:
+                            break
+                        event_type, gen_id, text = self.llm_event_queue.get_nowait()
+                        drained_events += 1
+                        if event_type != "append" or not text:
+                            continue
+                        if gen_id < active_gen:
+                            continue
+
                         timestamp_ms = int(time.time() * 1000)
-                        if action == "reset":
+                        if gen_id > active_gen:
                             self.lm_gen.update_oracle_tokens_streaming(None, reset=True)
+                            active_gen = gen_id
                             _append_session_log("oracle_stream.txt", f"{timestamp_ms}: [RESET]\n")
-                        elif action == "append" and payload:
-                            token_ids = list(self.text_tokenizer.encode(payload))  # type: ignore[attr-defined]
-                            self.lm_gen.update_oracle_tokens_streaming(token_ids, reset=False)
-                            _append_session_log("oracle_stream.txt", f"{timestamp_ms}: {payload}\n")
+                            _append_session_log("llm_stream_words.txt", f"{timestamp_ms}: [RESET gen={gen_id}]\n")
+
+                        token_ids = list(self.text_tokenizer.encode(text))  # type: ignore[attr-defined]
+                        self.lm_gen.update_oracle_tokens_streaming(token_ids, reset=False)
+                        self._hot_path_log("info", f"[LLM] {text}")
+                        _append_session_log("oracle_stream.txt", f"{timestamp_ms}: {text}\n")
+                        _append_session_log("llm_stream_words.txt", f"{timestamp_ms}: {text}\n")
                 except asyncio.QueueEmpty:
                     # Queue is empty; nothing to process, continue to next iteration.
                     pass
@@ -859,7 +1118,7 @@ class ServerState:
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore[attr-defined]
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
-                            log("info", f"text token '{_text}'")
+                            self._hot_path_log("info", f"text token '{_text}'")
                             add_to_conversation("moshi", _text.strip(), flush_file=False)
                             timestamp_ms = int(time.time() * 1000)
                             _append_session_log("moshi_words.txt", f"{timestamp_ms}: {_text.strip()}\n")
@@ -876,53 +1135,65 @@ class ServerState:
 
         log("info", "accepted connection")
         close = False
+        tasks: list[asyncio.Task] = []
         async with self.lock:
             ws = web.WebSocketResponse()
             await ws.prepare(request)
-            # All initialization inside lock to prevent race conditions
-            # Reset session transcript
-            with conversation_lock:
-                conversation_text = ""
-                current_speaker = None
+            try:
+                # All initialization and cleanup stay inside the session lock.
+                with conversation_lock:
+                    conversation_text = ""
+                    current_speaker = None
 
-            # Reset ASR-only word counter for new session
-            self._committed_units_asr = 0
-            self._last_logged_total_units = 0
-            self._max_pending_units = 0
+                # Reset ASR state for new session
+                async with self._pending_lock:
+                    self._pending_user_text = ""
+                self._committed_units_asr = 0
+                self._last_logged_total_units = 0
+                self._max_pending_units = 0
 
-            self.llm_stream_manager.last_start_total_units = 0
-            self.llm_stream_manager.current_stream = None
-            self.llm_stream_manager.restart_history.clear()
+                _clear_session_logs()
 
-            _clear_session_logs()
+                # Stop any old LLM stream and drain old generation events.
+                await self._cleanup_llm_stream()
 
-            # Stop any old LLM stream (including current_stream)
-            await self._cleanup_llm_stream()
+                self.session_logger.start_session()
 
-            self.loop = asyncio.get_running_loop()
+                self.loop = asyncio.get_running_loop()
+                self.llm_mux.start_session(self.loop)
+                await self.llm_mux.warmup_generation()
 
-            # Register ASR callbacks (must be before start)
-            if self.asr_processor:
-                self.asr_processor.register_callbacks(self._asr_on_partial, self._asr_on_final)
-                await self.asr_processor.start()
+                # Register ASR callbacks (must be before start)
+                if self.asr_processor:
+                    self.asr_processor.register_callbacks(self._asr_on_partial, self._asr_on_final)
+                    await self.asr_processor.start()
 
-            # Start LLM stream manager
-            self.llm_stream_manager.running = True
-            self.llm_stream_task = asyncio.create_task(self.llm_stream_manager.run_periodic_streaming())
+                # Initialize streaming components
+                opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
+                opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+                self.mimi.reset_streaming()
+                self.lm_gen.reset_streaming()
+                await ws.send_bytes(b"\x00")  # handshake
+                tasks = [
+                    asyncio.create_task(opus_loop()),
+                    asyncio.create_task(recv_loop()),
+                    asyncio.create_task(send_loop()),
+                ]
+                await asyncio.gather(*tasks)
+            finally:
+                close = True
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Initialize streaming components
-            opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
-            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
-            self.mimi.reset_streaming()
-            self.lm_gen.reset_streaming()
-            await ws.send_bytes(b"\x00")  # handshake
-            await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+                if self.asr_processor:
+                    await self.asr_processor.stop()
 
-        # Cleanup
-        await self._cleanup_llm_stream()
+                await self._cleanup_llm_stream()
 
-        if self.asr_processor:
-            await self.asr_processor.stop()
+                self.loop = None
+                self.session_logger.finish_session()
 
         log("info", "done with connection")
         return ws
@@ -975,6 +1246,24 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable ASR processing for transcription (default: True)",
+    )
+    parser.add_argument(
+        "--min-restart-interval",
+        type=float,
+        default=0.50,
+        help="Minimum interval in seconds between background LLM stream starts.",
+    )
+    parser.add_argument(
+        "--max-prompt-chars",
+        type=int,
+        default=6000,
+        help="Maximum prompt characters sent to the backend LLM.",
+    )
+    parser.add_argument(
+        "--max-concurrent-streams",
+        type=int,
+        default=7,
+        help="Maximum number of concurrent background LLM streams.",
     )
     parser.add_argument(
         "--ssl",
@@ -1042,6 +1331,9 @@ def main():
         args.cfg_coef,
         args.device,
         enable_asr=args.enable_asr,
+        min_restart_interval=args.min_restart_interval,
+        max_prompt_chars=args.max_prompt_chars,
+        max_concurrent_streams=args.max_concurrent_streams,
         **checkpoint_info.lm_gen_config,
     )
     log("info", "warming up the model")
@@ -1084,7 +1376,10 @@ def main():
 
     log("info", f"Access the Web UI directly at {protocol}://{args.host}:{args.port}")
     if args.enable_asr:
-        log("info", "ASR processing enabled (English) - partials stream to LLM; finals commit to transcript")
+        log(
+            "info",
+            "ASR processing enabled (English) - partials nudge parallel LLM streams; finals commit to transcript",
+        )
     if setup_tunnel is not None:
         tunnel_kwargs = {}
         if "share_server_tls_certificate" in inspect.signature(setup_tunnel).parameters:

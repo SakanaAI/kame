@@ -103,7 +103,7 @@ uv add "kame-model @ git+https://github.com/SakanaAI/kame.git@1a69ee29dbd201d400
 export OPENAI_API_KEY=...
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/google-cloud-credentials.json
 
-uv run python -m kame.server_oracle_parallel \
+uv run python -m kame.server_oracle \
   --hf-repo SakanaAI/kame \
   --host 0.0.0.0 \
   --port 8998 \
