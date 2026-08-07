@@ -73,5 +73,8 @@ quantization = [
 [tool.ruff]
 line-length = 120
 
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pyright]
 reportPrivateImportUsage = false
